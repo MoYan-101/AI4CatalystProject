@@ -1,0 +1,64 @@
+data:
+#  path: "./data/Dataset_20250205_without1.csv"   # CSV file path
+  path: "./data/Dataset_20250205_final.csv"   # CSV file path
+  test_size: 0.2
+  random_seed: 42
+
+preprocessing:
+  standardize_input: true
+  standardize_output: false  # If true, apply StandardScaler to Y
+
+model:
+  type: "CatBoost"   # options: "ANN", "RF", "GAN", "DT", "CatBoost", "XGB"
+
+  ann_params:
+    input_dim: 10        # 这个数值不再硬编码；会在 main.py 里被 X_train_s.shape[1] 覆盖
+    output_dim: 4       # 同上，在 main.py 覆盖
+    hidden_dims: [32, 64, 32]
+    learning_rate: 1e-5
+    epochs: 30
+    batch_size: 300
+    checkpoint_path: "./models/best_ann.pt"
+
+  rf_params:
+    n_estimators: 100
+    max_depth: 10
+
+  gan_params:
+    pass  # placeholder
+    # 新增: 决策树参数
+
+  dt_params:
+    max_depth: 5
+    random_state: 42
+
+  # 新增: CatBoost 参数
+  catboost_params:
+    iterations: 100
+    learning_rate: 0.1
+    depth: 6
+    random_seed: 42
+
+  # 新增: XGBoost 参数
+  xgb_params:
+    n_estimators: 100
+    learning_rate: 0.1
+    max_depth: 6
+    random_seed: 42
+
+loss:
+  type: "mse"  # "mse" or "mae"
+
+training:
+  log_interval: 5
+
+evaluation:
+  save_loss_curve: true
+  save_scatter_mse_plot: true
+  save_scatter_mae_plot: true
+  save_residual_hist: true
+  save_residual_kde: true
+  save_heatmap: true
+#  save_partial_dependence: false
+  save_correlation: true
+  save_feature_importance_bar: true
