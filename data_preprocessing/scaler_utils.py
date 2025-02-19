@@ -3,34 +3,43 @@ data_preprocessing/scaler_utils.py
 
 Contains functions for data standardization (using StandardScaler),
 as well as saving/loading scaler objects for future use.
+
+【去掉原先的 logit transform】, 保留/新增 bounded transform(0..100 => -1..1).
 """
 
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 import joblib
 
+def bounded_transform(y):
+    """
+    y in [0,100] => z in [-1,1], linear:
+        z = 2*(y/100) - 1
+    clamp y to [0,100] just in case
+    """
+    y_ = np.clip(y, 0, 100)
+    return 2*(y_/100.0) - 1
+
+def inverse_bounded_transform(z):
+    """
+    z => clamp in [-1,1], => y=100*(z+1)/2 in [0,100]
+    """
+    z_ = np.clip(z, -1, 1)
+    return 100.0*(z_+1.0)/2.0
+
 def standardize_data(X_train, X_val,
                      Y_train, Y_val,
-                     do_input=True, do_output=False,
-                     numeric_cols_idx=None):
+                     do_input=True,
+                     do_output=False,
+                     numeric_cols_idx=None,
+                     do_output_bounded=False):
     """
     Optionally standardize input features (X) and/or output targets (Y).
-    We skip one-hot columns for X by only applying the scaler to numeric_cols_idx.
-
-    :param X_train: (N_train, input_dim)
-    :param X_val:   (N_val,   input_dim)
-    :param Y_train: (N_train, output_dim)
-    :param Y_val:   (N_val,   output_dim)
-    :param do_input: whether to standardize X
-    :param do_output: whether to standardize Y
-    :param numeric_cols_idx: list of column indices in X that are numeric
-    :return:
-       (X_train_s, X_val_s, scaler_x), (Y_train_s, Y_val_s, scaler_y)
+    If do_output_bounded=True => 0..100 => -1..1 => standard => model.
     """
     scaler_x = None
     scaler_y = None
 
-    # Make copies to avoid modifying original
     X_train_s = np.copy(X_train)
     X_val_s   = np.copy(X_val)
     Y_train_s = np.copy(Y_train)
@@ -38,53 +47,62 @@ def standardize_data(X_train, X_val,
 
     if do_input:
         if numeric_cols_idx is None:
-            # If user didn't provide numeric_cols_idx, we assume all columns are numeric
             numeric_cols_idx = list(range(X_train.shape[1]))
-
         scaler_x = StandardScaler()
-        # Fit only on numeric cols
         scaler_x.fit(X_train_s[:, numeric_cols_idx])
-
-        # Transform
         X_train_s[:, numeric_cols_idx] = scaler_x.transform(X_train_s[:, numeric_cols_idx])
         X_val_s[:, numeric_cols_idx]   = scaler_x.transform(X_val_s[:, numeric_cols_idx])
-    # else: no standardization on X
 
     if do_output:
+        # bounded or not
+        if do_output_bounded:
+            # 0..100 => -1..1
+            for i in range(Y_train_s.shape[1]):
+                Y_train_s[:,i] = bounded_transform(Y_train_s[:,i])
+                Y_val_s[:,i]   = bounded_transform(Y_val_s[:,i])
+            transform_type = "bounded+standard"
+        else:
+            transform_type = "standard"
 
-        Y_train_s = scaler_y.transform(Y_train_s)
-        Y_val_s   = scaler_y.transform(Y_val_s)
-    # else: no standardization on Y
+        # standard
+        scaler_obj = StandardScaler()
+        scaler_obj.fit(Y_train_s)
+        Y_train_s = scaler_obj.transform(Y_train_s)
+        Y_val_s   = scaler_obj.transform(Y_val_s)
+
+        scaler_y = {
+            "type": transform_type,
+            "scaler": scaler_obj
+        }
 
     return (X_train_s, X_val_s, scaler_x), (Y_train_s, Y_val_s, scaler_y)
 
-
 def save_scaler(scaler, path):
-    """
-    Save a fitted scaler to disk using joblib.
-    :param scaler: the StandardScaler (or similar) object
-    :param path: file path to save
-    """
     if scaler is not None:
         joblib.dump(scaler, path)
 
-
 def load_scaler(path):
-    """
-    Load a scaler from disk.
-    :param path: file path
-    :return: loaded scaler
-    """
     return joblib.load(path)
-
 
 def inverse_transform_output(y_pred, scaler_y):
     """
-    If output was scaled, invert the transformation for final predictions.
-    :param y_pred: predicted outputs, shape (N, output_dim)
-    :param scaler_y: the fitted scaler for output
-    :return: predictions in original scale
+    If scaler_y["type"]=="bounded+standard": inverse standard => inverse_bounded => [0,100].
+    If "standard": just inverse standard.
     """
     if scaler_y is None:
         return y_pred
-    return scaler_y.inverse_transform(y_pred)
+    if not isinstance(scaler_y, dict):
+        # older usage => direct standard
+        return scaler_y.inverse_transform(y_pred)
+
+    transform_type = scaler_y["type"]
+    scaler_obj = scaler_y["scaler"]
+    # 1) inverse standard
+    y_ = scaler_obj.inverse_transform(y_pred)
+
+    if transform_type.startswith("bounded"):
+        # each col => clamp => [0,100]
+        for i in range(y_.shape[1]):
+            y_[:,i] = inverse_bounded_transform(y_[:,i])
+
+    return y_

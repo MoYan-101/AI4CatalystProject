@@ -7,17 +7,22 @@ A simple XGBoost regressor wrapper using the scikit-learn API.
 from xgboost import XGBRegressor
 
 class XGBRegression:
-    def __init__(self, n_estimators=100, learning_rate=0.1, max_depth=6, random_state=42):
+    """
+    XGBoost with reg_alpha, reg_lambda for L1/L2 regularization.
+    """
+    def __init__(self, n_estimators=100, learning_rate=0.1, max_depth=6,
+                 random_state=42, reg_alpha=0.0, reg_lambda=1.0):
         self.model = XGBRegressor(
             n_estimators=n_estimators,
             learning_rate=learning_rate,
             max_depth=max_depth,
             random_state=random_state,
-            verbosity=0
+            verbosity=0,
+            reg_alpha=reg_alpha,
+            reg_lambda=reg_lambda
         )
 
     def fit(self, X, Y):
-        # 若 Y 是多列，需确认 xgboost 版本是否支持多输出
         self.model.fit(X, Y)
 
     def predict(self, X):

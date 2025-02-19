@@ -1,19 +1,14 @@
-"""
-models/model_dt.py
-
-A simple Decision Tree regressor wrapper using scikit-learn.
-"""
-
 from sklearn.tree import DecisionTreeRegressor
 
 class DTRegression:
     """
-    A simple regression model using DecisionTree from scikit-learn.
+    Decision Tree with optional ccp_alpha (cost-complexity pruning).
     """
-    def __init__(self, max_depth=None, random_state=42):
+    def __init__(self, max_depth=None, random_state=42, ccp_alpha=0.0):
         self.model = DecisionTreeRegressor(
             max_depth=max_depth,
-            random_state=random_state
+            random_state=random_state,
+            ccp_alpha=ccp_alpha
         )
 
     def fit(self, X, Y):

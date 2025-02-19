@@ -10,16 +10,20 @@ class RFRegression:
     """
     A simple regression model using RandomForest from scikit-learn.
     """
-    def __init__(self, n_estimators=100, max_depth=10, random_state=42):
+
+    def __init__(self, n_estimators=100, max_depth=10, random_state=42,
+                 ccp_alpha=0.0, min_samples_leaf=1):
         """
-        :param n_estimators: number of trees in the forest
-        :param max_depth: maximum depth of the trees
-        :param random_state: seed for reproducibility
-        """
+               :param n_estimators: number of trees in the forest
+               :param max_depth: maximum depth of the trees
+               :param random_state: seed for reproducibility
+               """
         self.model = RandomForestRegressor(
             n_estimators=n_estimators,
             max_depth=max_depth,
-            random_state=random_state
+            random_state=random_state,
+            ccp_alpha=ccp_alpha,
+            min_samples_leaf=min_samples_leaf
         )
 
     def fit(self, X, Y):
