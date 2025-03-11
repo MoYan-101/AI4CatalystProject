@@ -24,9 +24,11 @@ import math
 import scipy.stats as ss
 from matplotlib.patches import Patch
 from sklearn.metrics import r2_score
-import phik
-from phik import phik_matrix
-from mpl_toolkits.mplot3d import Axes3D
+from scipy.stats import pearsonr, spearmanr, pointbiserialr
+from matplotlib.ticker import MaxNLocator, FormatStrFormatter, LinearLocator  # 如果文件顶部已经导入可省略
+import matplotlib.ticker as ticker
+
+
 
 def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
@@ -76,54 +78,203 @@ def short_label(s: str) -> str:
     return last_part[0].upper() + last_part[1:]
 
 
-# --------------- 相关性可视化phik ---------------
-def plot_phik_correlation_heatmap(df, filename,
-                                  interval_cols=None,
-                                  cmap="ocean",
-                                  vmin=0, vmax=1):
+# --------------- 相关性可视化---------------
+# ============== 检测变量类型 ==============
+def detect_var_type(series: pd.Series) -> str:
     """
-    使用 Phik 计算 df 各列间的相关系数 (0..1)，再画热力图。
-    - df: pandas.DataFrame (带原始列名)
-    - interval_cols: 哪些列是数值，需要自动分箱
-    - 绘图时, 行列名都改成 short_label(...) 后的名字
+    检测单个变量（Series）类型:
+      - "cont" => 连续型(数值, 且 unique 值 >2)
+      - "bin"  => 二分类(只有2个唯一值)
+      - "cat"  => 多分类(>2个唯一值 或 object类型)
+    """
+    if pd.api.types.is_numeric_dtype(series):
+        unique_vals = series.dropna().unique()
+        if len(unique_vals) == 2:
+            return "bin"
+        else:
+            return "cont"
+    else:
+        # object => 分类
+        unique_vals = series.dropna().unique()
+        if len(unique_vals) == 2:
+            return "bin"
+        else:
+            return "cat"
+
+# ============== 相关系数的具体函数 ==============
+def cramers_v(x, y) -> float:
+    """
+    Cramér’s V => [0,1]（无方向）
+    """
+    confusion_matrix = pd.crosstab(x, y)
+    chi2 = ss.chi2_contingency(confusion_matrix)[0]
+    n = confusion_matrix.sum().sum()
+    r, k = confusion_matrix.shape
+    phi2 = max(0, chi2 - (k - 1)*(r - 1)/(n-1))
+    r_adj = r - (r-1)**2/(n-1)
+    k_adj = k - (k-1)**2/(n-1)
+    denom = min(k_adj-1, r_adj-1)
+    if denom == 0:
+        return 0.0
+    else:
+        return math.sqrt(phi2/denom)
+
+def correlation_ratio(cat_data, num_data) -> float:
+    """
+    Eta 系数 => [0,1]（无方向）
+    cat_data: 分类
+    num_data: 数值
+    """
+    df = pd.DataFrame({'cat': cat_data, 'val': num_data})
+    df.dropna(inplace=True)
+    if df.shape[0] == 0:
+        return 0.0
+
+    group_means = df.groupby('cat')['val'].mean()
+    mean_all = df['val'].mean()
+
+    ss_between = 0
+    for cat_value, group_mean in group_means.items():
+        group = df[df['cat'] == cat_value]
+        n = len(group)
+        ss_between += n * (group_mean - mean_all) ** 2
+
+    ss_total = ((df['val'] - mean_all) ** 2).sum()
+    if ss_total == 0:
+        return 0.0
+    eta = math.sqrt(ss_between / ss_total)
+    return eta
+
+# ============== 裁剪辅助 ==============
+def clamp_corr_value(value: float, method: str) -> float:
+    """
+    根据不同相关系数的类型，对 'value' 进行数值裁剪。
+    method: 字符串标识，用来区分是 'pearson', 'spearman', 'point-biserial', 'phi' (有方向, [-1,1])；
+            或 'cramer', 'eta' (无方向, [0,1])。
+    """
+    # 有方向的相关系数 => [-1, 1]
+    directed_methods = {"pearson", "spearman", "point-biserial", "phi"}
+    # 无方向的相关系数 => [0, 1]
+    undirected_methods = {"cramer", "eta"}
+
+    if method in directed_methods:
+        return max(min(value, 1.0), -1.0)
+    elif method in undirected_methods:
+        return max(min(value, 1.0), 0.0)
+    else:
+        # 如果不确定，则默认强行剪到 [-1,1]
+        return max(min(value, 1.0), -1.0)
+
+# ============== 计算混合相关系数 ==============
+def compute_mixed_correlation(x: pd.Series, y: pd.Series,
+                              type_x: str, type_y: str) -> float:
+    """
+    根据类型组合，调用对应相关系数:
+    - cont vs cont => Spearman
+    - cont vs bin  => Point-Biserial
+    - bin vs bin   => Phi (二分类下 Pearson)
+    - cont vs cat  => Eta
+    - cat vs cat   => Cramér’s V
+    - bin vs cat(>2) => 也走 cat vs cat => Cramér’s V
+    """
+    valid_mask = (~x.isna()) & (~y.isna())
+    x_ = x[valid_mask]
+    y_ = y[valid_mask]
+
+    # cont vs cont => spearman
+    if type_x=="cont" and type_y=="cont":
+        r, _ = ss.spearmanr(x_, y_)
+        # clamp => [-1,1]
+        return clamp_corr_value(r, "spearman")
+
+    # cont vs bin => point-biserial
+    if (type_x=="cont" and type_y=="bin") or (type_x=="bin" and type_y=="cont"):
+        # 强制 bin => 0,1
+        if type_x=="bin":
+            bin_data = x_.astype('category').cat.codes
+            cont_data= y_
+        else:
+            bin_data = y_.astype('category').cat.codes
+            cont_data= x_
+        r, _ = ss.pointbiserialr(bin_data, cont_data)
+        return clamp_corr_value(r, "point-biserial")
+
+    # bin vs bin => phi => 直接用 Pearson
+    if type_x=="bin" and type_y=="bin":
+        bin_x = x_.astype('category').cat.codes
+        bin_y = y_.astype('category').cat.codes
+        r, _ = ss.pearsonr(bin_x, bin_y)
+        return clamp_corr_value(r, "phi")
+
+    # cont vs cat => Eta
+    if (type_x=="cont" and type_y=="cat"):
+        val_ = correlation_ratio(y_, x_)
+        return clamp_corr_value(val_, "eta")
+    if (type_x=="cat" and type_y=="cont"):
+        val_ = correlation_ratio(x_, y_)
+        return clamp_corr_value(val_, "eta")
+
+    # cat vs cat => Cramér’s V (含 bin vs cat)
+    val_ = cramers_v(x_, y_)
+    return clamp_corr_value(val_, "cramer")
+
+def plot_mixed_correlation_heatmap(df: pd.DataFrame,
+                                   filename: str,
+                                   vmin=-1, vmax=1,
+                                   cmap="ocean"):
+    """
+    计算 df 各列的“混合相关系数” (cont/cat/bin) 并画热力图。
+    - 计算得到的结果会根据相关系数类型进行数值裁剪:
+      - Spearman / Point-biserial / Phi => [-1,1]
+      - Cramér’s V / Eta => [0,1]
+    - 最终画图时的颜色范围由 vmin, vmax 控制 (默认 -1~1, 适合既有正相关也有负相关).
     """
     ensure_dir_for_file(filename)
 
-    if interval_cols is None:
-        interval_cols = []
+    all_cols = df.columns.tolist()
+    col_types = {}
+    for c in all_cols:
+        col_types[c] = detect_var_type(df[c])
 
-    # 1) 用原始 df 的列名来计算 phik
-    phik_mat = df.phik_matrix(interval_cols=interval_cols)
+    n = len(all_cols)
+    corr_matrix = np.zeros((n,n), dtype=float)
+    corr_matrix[:] = np.nan
 
-    # 2) 计算完成后, 把 phik_mat 的行列都做 short_label
-    old_cols = list(phik_mat.columns)
-    new_cols = [short_label(c) for c in old_cols]
+    # 计算相关系数
+    for i in range(n):
+        corr_matrix[i,i] = 1.0
+        for j in range(i+1, n):
+            col_i = all_cols[i]
+            col_j = all_cols[j]
+            type_i = col_types[col_i]
+            type_j = col_types[col_j]
+            r = compute_mixed_correlation(df[col_i], df[col_j], type_i, type_j)
+            corr_matrix[i,j] = r
+            corr_matrix[j,i] = r
 
-    # 改一下 phik_mat 的行列
-    phik_mat2 = phik_mat.copy()
-    phik_mat2.columns = new_cols
-    phik_mat2.index = new_cols
+    # 简写列名
+    new_labels = [short_label(c) for c in all_cols]
 
-    # 3) 画热力图
-    fig, ax = plt.subplots(figsize=(max(10, 0.5*len(new_cols)), max(8, 0.5*len(new_cols))))
-    sns.heatmap(phik_mat2,
-                xticklabels=new_cols,
-                yticklabels=new_cols,
+    # 绘图
+    fig, ax = plt.subplots(figsize=(max(10,0.5*n), max(8,0.5*n)))
+    sns.heatmap(corr_matrix,
+                xticklabels=new_labels,
+                yticklabels=new_labels,
                 cmap=cmap,
-                vmin=vmin,
-                vmax=vmax,
+                vmin=vmin, vmax=vmax,
+                annot=False, fmt=".2f",
                 square=True,
-                annot=True,
-                fmt=".2f",
-                cbar_kws={"shrink": 0.8, "aspect": 30, "label": "Phik Correlation"},
+                cbar_kws={"shrink":0.8,"aspect":30,"label":"Mixed Corr."},
                 ax=ax)
-    ax.set_title("Phik Correlation Heatmap", fontsize=14)
+
+    ax.set_title("Correlation Heatmap", fontsize=14)
     plt.xticks(rotation=45, ha="right", fontsize=12)
     plt.yticks(fontsize=12)
     plt.tight_layout()
+
     plt.savefig(filename, dpi=700)
     plt.close()
-    print(f"[plot_phik_correlation_heatmap] => {filename}")
+    print(f"[plot_mixed_correlation_heatmap] => {filename}")
 
 # --------------- 训练可视化: Loss, scatter, residual, etc. ---------------
 def plot_loss_curve(train_losses, val_losses, filename):
@@ -197,7 +348,7 @@ def plot_scatter_3d_outputs_mae(y_true, y_pred, y_labels=None, filename="scatter
 def plot_residual_histogram(
         y_true, y_pred, y_labels=None,
         cmap_name="coolwarm",
-        vmin=-45, vmax=45,
+        vmin=-70, vmax=70,
         filename="residual_hist_bottom.jpg"
 ):
     ensure_dir_for_file(filename)
@@ -251,11 +402,19 @@ def plot_residual_histogram(
     plt.close()
     print(f"[plot_residual_histogram] => {filename}")
 
+class MyScalarFormatter(ticker.ScalarFormatter):
+    def __init__(self, useMathText=True):
+        super().__init__(useMathText=useMathText)
+        # 这里也可以在外部调用 set_powerlimits((0,0)) 来强制科学计数法
+
+    def _set_format(self):
+        # 关键：只显示一位小数
+        self.format = '%.1f'
 
 def plot_residual_kde(
     y_true, y_pred, y_labels=None,
     cmap_name="coolwarm",
-    vmin=-45, vmax=45,
+    vmin=-70, vmax=70,
     filename="residual_kde_bottom.jpg"
 ):
     ensure_dir_for_file(filename)
@@ -304,6 +463,18 @@ def plot_residual_kde(
         ax.set_xlabel("Residual")
         ax.set_ylabel("Density")
         ax.set_xlim(vmin, vmax)
+        # ========== 这里是关键修改部分 ========== #
+        # 1) 设置最多 5 个刻度
+        ax.yaxis.set_major_locator(ticker.LinearLocator(5))
+
+        # 2) 使用自定义的 ScalarFormatter 强制科学计数法 + 一位小数
+        my_formatter = MyScalarFormatter(useMathText=True)
+        my_formatter.set_powerlimits((0, 0))  # 强制使用科学计数法
+        ax.yaxis.set_major_formatter(my_formatter)
+
+        # 3) 可选：调整 “×1e7” 之类 offset 文字的字体大小
+        ax.yaxis.get_offset_text().set_fontsize(9)
+        # ========== 修改结束 ========== #
 
     sm = cm.ScalarMappable(norm=norm, cmap=cmap)
     sm.set_array([])
@@ -423,11 +594,11 @@ def plot_three_metrics_horizontal(metrics_data, save_name="three_metrics.jpg"):
         ax.legend(handles=legend_e, loc="lower right")
 
     # (a) MSE
-    plot_hbar_with_mean(axes[0], model_names, mse_vals, "(a)", "MSE (Lower=Better)", bigger_is_better=False)
+    plot_hbar_with_mean(axes[0], model_names, mse_vals, "a", "MSE (Lower=Better)", bigger_is_better=False)
     # (b) MAE
-    plot_hbar_with_mean(axes[1], model_names, mae_vals, "(b)", "MAE (Lower=Better)", bigger_is_better=False)
+    plot_hbar_with_mean(axes[1], model_names, mae_vals, "b", "MAE (Lower=Better)", bigger_is_better=False)
     # (c) R2
-    plot_hbar_with_mean(axes[2], model_names, r2_vals, "(c)", "R2 (Higher=Better)", bigger_is_better=True)
+    plot_hbar_with_mean(axes[2], model_names, r2_vals, "c", "R2 (Higher=Better)", bigger_is_better=True)
 
     plt.tight_layout()
     plt.savefig(save_name, dpi=700)
@@ -490,9 +661,9 @@ def plot_overfitting_horizontal(overfit_data, save_name="overfitting_horizontal.
         max_val= arr.max()
         min_val= arr.min()
         if min_val<0:
-            ax.set_xlim(min_val*1.1, max_val*1.79)
+            ax.set_xlim(min_val*1.1, max_val*2.5)
         else:
-            ax.set_xlim(0, max_val*1.79)
+            ax.set_xlim(0, max_val*2.5)
 
         legend_e.extend([
             Patch(facecolor="red", label="Best"),
@@ -501,9 +672,9 @@ def plot_overfitting_horizontal(overfit_data, save_name="overfitting_horizontal.
         ])
         ax.legend(handles=legend_e, loc="lower right")
 
-    plot_hbar_threshold(axes[0], model_names, msr_vals, "(a)", "MSE Ratio (Val/Train)\n(Lower=Better)",
-                        bigger_is_better=False, threshold_h=10)
-    plot_hbar_threshold(axes[1], model_names, r2d_vals, "(b)", "R2 diff (Train - Val)\n(Lower=Better)",
+    plot_hbar_threshold(axes[0], model_names, msr_vals, "a", "MSE Ratio (Val/Train)\n(Lower=Better)",
+                        bigger_is_better=False, threshold_h=10, threshold_l=5)
+    plot_hbar_threshold(axes[1], model_names, r2d_vals, "b", "R2 diff (Train - Val)\n(Lower=Better)",
                         bigger_is_better=False, threshold_h=0.2, threshold_l=0.15)
 
     plt.tight_layout()
@@ -514,58 +685,68 @@ def plot_overfitting_horizontal(overfit_data, save_name="overfitting_horizontal.
 # --------------- 原始数据分析 ---------------
 def plot_kde_distribution(df, columns, filename):
     ensure_dir_for_file(filename)
-    fig, axes= plt.subplots(1,len(columns), figsize=(5*len(columns),5))
-    if len(columns)==1:
-        axes= [axes]
-    for i,col in enumerate(columns):
-        ax= axes[i]
+    fig, axes = plt.subplots(1, len(columns), figsize=(5 * len(columns), 5))
+    if len(columns) == 1:
+        axes = [axes]
+    for i, col in enumerate(columns):
+        ax = axes[i]
         if col not in df.columns:
-            ax.text(0.5,0.5,f"'{col}' not in df", ha='center', va='center')
+            ax.text(0.5, 0.5, f"'{col}' not in df", ha='center', va='center')
             continue
 
         sns.kdeplot(df[col], ax=ax, fill=False, color="black", clip=(df[col].min(), df[col].max()))
-        lines= ax.get_lines()
+        lines = ax.get_lines()
         if not lines:
             ax.set_title(f"No Data for {col}")
             continue
 
-        line= lines[-1]
-        x_plot, y_plot= line.get_xdata(), line.get_ydata()
-        idxsort= np.argsort(x_plot)
-        x_plot, y_plot= x_plot[idxsort], y_plot[idxsort]
+        line = lines[-1]
+        x_plot, y_plot = line.get_xdata(), line.get_ydata()
+        idxsort = np.argsort(x_plot)
+        x_plot, y_plot = x_plot[idxsort], y_plot[idxsort]
 
         vmin = max(np.min(x_plot), df[col].min())  # 发现负数
         vmax = min(np.max(x_plot), df[col].max())
-        cmap= cm.get_cmap("coolwarm")
-        norm= mcolors.Normalize(vmin=vmin, vmax=vmax)
+        cmap = cm.get_cmap("coolwarm")
+        norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
 
-        for j in range(len(x_plot)-1):
-            x0, x1= x_plot[j], x_plot[j+1]
-            y0, y1= y_plot[j], y_plot[j+1]
-            color= cmap(norm((x0+x1)*0.5))
-            verts= np.array([
-                [x0,0],
-                [x0,y0],
-                [x1,y1],
-                [x1,0]
+        for j in range(len(x_plot) - 1):
+            x0, x1 = x_plot[j], x_plot[j + 1]
+            y0, y1 = y_plot[j], y_plot[j + 1]
+            color = cmap(norm((x0 + x1) * 0.5))
+            verts = np.array([
+                [x0, 0],
+                [x0, y0],
+                [x1, y1],
+                [x1, 0]
             ])
-            poly= PolyCollection([verts], facecolors=[color], edgecolor='none', alpha=0.6)
+            poly = PolyCollection([verts], facecolors=[color], edgecolor='none', alpha=0.6)
             ax.add_collection(poly)
 
         ax.set_title(f"KDE of {col}")
-        ax.set_xlabel(col)
-        ax.set_ylabel("Density")
+        ax.set_xlabel(col, fontsize=14)
+        ax.set_ylabel("Density", fontsize=14)
         ax.set_xlim(df[col].min(), df[col].max())
 
-        sm= cm.ScalarMappable(norm=norm, cmap=cmap)
+        # ---------- 关键：设置 y 轴刻度 ----------
+        ax.yaxis.set_major_locator(ticker.MaxNLocator(5))  # 最多 5 个主刻度
+        my_formatter = MyScalarFormatter(useMathText=True)  # 之前已定义好的自定义 Formatter
+        my_formatter.set_powerlimits((0, 0))  # 强制使用科学计数法
+        ax.yaxis.set_major_formatter(my_formatter)
+        ax.yaxis.get_offset_text().set_fontsize(9)
+        # --------------------------------------
+
+        sm = cm.ScalarMappable(norm=norm, cmap=cmap)
         sm.set_array([])
-        cb= plt.colorbar(sm, ax=ax)
-        cb.set_label("Value Range", fontweight='bold', fontsize=12)
-        cb.ax.tick_params(labelsize=10)
+        cb = plt.colorbar(sm, ax=ax)
+        cb.set_label("Value Range", fontweight='bold', fontsize=14)
+        cb.ax.tick_params(labelsize=12)
 
     plt.tight_layout()
     plt.savefig(filename, dpi=700)
     plt.close()
+    print(f"[plot_residual_histogram] => {filename}")
+
 
 def plot_catalyst_size_vs_product(df, filename):
     ensure_dir_for_file(filename)
@@ -824,6 +1005,13 @@ def plot_3d_surface_from_heatmap(grid_x, grid_y, heatmap_pred,
         ax.set_xlabel(x_label, fontsize=12)
         ax.set_ylabel(y_label, fontsize=12)
         ax.set_zlabel("Value", fontsize=12)
+        ax.xaxis.set_major_locator(MaxNLocator(5))
+        ax.xaxis.set_major_formatter(FormatStrFormatter('%.1f'))
+        # =========== 仅修改 z轴部分，使用自定义 Formatter ===========
+        ax.zaxis.set_major_locator(LinearLocator(5))
+        ax.zaxis.set_major_formatter(FormatStrFormatter('%.d'))
+        # ========================================================
+        # ======== colorbar 与 z 轴保持一致 ========
         ax.grid(False)
 
         out_jpg = os.path.join(out_dir, f"heatmap_3d_surface_output_{odx+1}.jpg")
@@ -861,7 +1049,7 @@ def plot_confusion_from_npy(confusion_pred,
     dim_used = min(4, out_dim)
 
     # 为每个维度计算归一化 (0..1)
-    cmaps = [plt.get_cmap("Reds"), plt.get_cmap("Blues"),
+    cmaps = [plt.get_cmap("Purples"), plt.get_cmap("Blues"),
              plt.get_cmap("Greens"), plt.get_cmap("Oranges")]
     norms = []
 
@@ -933,11 +1121,11 @@ def plot_confusion_from_npy(confusion_pred,
 
     ax.set_xticks([(j + 0.5) * cell_scale for j in range(n_cols)])
     ax.set_yticks([(i + 0.5) * cell_scale for i in range(n_rows)])
-    ax.set_xticklabels(col_labels, rotation=45, ha='right', fontsize=10)
-    ax.set_yticklabels(row_labels, fontsize=7.5)
+    ax.set_xticklabels(col_labels, rotation=45, ha='right', fontsize=12)
+    ax.set_yticklabels(row_labels, fontsize=9)
 
-    ax.set_ylabel(row_axis_name, fontsize=12)
-    ax.set_xlabel(col_axis_name, fontsize=12)
+    ax.set_ylabel(row_axis_name, fontsize=14)
+    ax.set_xlabel(col_axis_name, fontsize=14)
 
     # 画 ColorBar（顶端）
     cbar_width = 0.21
@@ -957,7 +1145,7 @@ def plot_confusion_from_npy(confusion_pred,
         else:
             short_lbl = f"Out {odx}"
 
-        cb_.set_label(short_lbl, fontsize=9, labelpad=2)
+        cb_.set_label(short_lbl, fontsize=12, labelpad=2)
         # cb_.ax.tick_params(labelsize=8)
         # 移除 colorbar 的刻度标签
         cb_.set_ticks([])

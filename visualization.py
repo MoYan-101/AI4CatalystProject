@@ -23,9 +23,8 @@ import joblib
 
 from utils import (
     ensure_dir,
-    ensure_dir_for_file,
     # phik correlation
-    plot_phik_correlation_heatmap,
+    plot_mixed_correlation_heatmap,
     # data analysis
     plot_kde_distribution,
     plot_catalyst_size_vs_product,
@@ -72,14 +71,13 @@ def visualize_main():
         df_raw_14 = pd.read_csv(raw_csv_path)
         # phik correlation
         if config["evaluation"].get("save_correlation", False):
-            fn1 = os.path.join(data_corr_dir, "phik_correlation_heatmap.jpg")
+            fn1 = os.path.join(data_corr_dir, "correlation_heatmap.jpg")
             numeric_cols_14 = df_raw_14.select_dtypes(include=[np.number]).columns.tolist()
-            plot_phik_correlation_heatmap(
+            plot_mixed_correlation_heatmap(
                 df_raw_14,
                 filename=fn1,
-                interval_cols=numeric_cols_14,
                 cmap="ocean",
-                vmin=0, vmax=1
+                vmin=-1, vmax=1
             )
 
         # 数据分析图
@@ -122,13 +120,12 @@ def visualize_main():
 
         df_onehot = pd.DataFrame(X_onehot, columns=onehot_colnames)
 
-        fn2 = os.path.join(data_corr_dir, "phik_correlation_heatmap_one_hot.jpg")
-        plot_phik_correlation_heatmap(
+        fn2 = os.path.join(data_corr_dir, "correlation_heatmap_one_hot.jpg")
+        plot_mixed_correlation_heatmap(
             df_onehot,
             filename=fn2,
-            interval_cols=[],  # 全部视为类别(0/1)
             cmap="ocean",
-            vmin=0, vmax=1
+            vmin=-1, vmax=1
         )
 
     # ========== 1.3) Y_train.npy, Y_val.npy ==========
