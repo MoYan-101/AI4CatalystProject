@@ -1,104 +1,137 @@
+# config.yaml
+# ---------------------------------------------------------
+# 数据相关
 data:
-#  path: "./data/Dataset_20250205_without1.csv"   # CSV file path
-  path: "./data/Dataset_20250218_final.csv"   # CSV file path
-#  path: "./data/Dataset_20250210_log.csv"
-#  path: "./data/Dataset_20250210_Cat.csv"
+  path: "./data/Test_0611_cleansed.csv"   # CSV 文件路径
+  input_len: 13      # ← 你想改就改
+  output_len: 4
+  test_size: 0.3
+  random_seed: 98 #123, 42, 36
 
-  test_size: 0.2
-  random_seed: 42
-
+# 预处理配置
 preprocessing:
   standardize_input: true
   standardize_output: true
-  bounded_output: true
+  bounded_output: false
+  bounded_output_columns: ["Methanol selectivity (%)", "CO2 conversion efficiency (%)", "CO selectivity (%)"]
 
+# 模型相关
+# 训练多个模型时，这里仅保留 checkpoint_path，所有其他超参数均来源于 optuna
 model:
-  # 一次性训练多个模型
   types: ["RF", "CatBoost", "DT", "ANN", "XGB"]
-#  types: ["CatBoost"]
-#  types: ["ANN"]
-  # ------------------- ANN 参数 (优化泛化能力) -------------------
+  # 对于深度学习模型（ANN），仅保留 checkpoint_path 用于后续加载
   ann_params:
-    input_dim: 10
-    output_dim: 4
-    hidden_dims: [16, 32, 64, 32, 16]        # 降低网络复杂度，减少参数数量
-    dropout: 0.01                 # 增加 Dropout 防止过拟合
-    learning_rate: 1e-3          # 降低学习率，减少过拟合
-    epochs: 6000                   # 适当增加训练轮数
-    batch_size: 200             # 增大 batch_size，提高稳定性
-    weight_decay: 3e-4           # 增强 L2 正则
-    checkpoint_path: "./models/ANN/best_ann.pt"
-    early_stopping: true         # 启用早停
-    patience: 200                 # 允许更多的耐心等待
-    optimizer: "AdamW"           # 使用 AdamW，改善正则化
-    activation: "leakyrelu"           # 使用 ReLU, leakyrelu, tanh, sigmoid
-    random_seed: 777
-
-  # ------------------- DT 参数 (优化深度与剪枝) -------------------
+    epochs: 6000
   dt_params:
-    max_depth: 10              # 适当降低深度，提高泛化能力
+    # 此处保留默认 random_state 字段（其他参数均由 optuna更新）
     random_state: 42
-    ccp_alpha: 0.05           # 增强剪枝力度，提高泛化能力
-
-  # ------------------- RF 参数 (优化超参数，提升泛化) -------------------
   rf_params:
-    n_estimators: 100         # 增加树的数量，提高泛化能力
-    max_depth: 8             # 适当提高深度
     random_state: 42
-    ccp_alpha: 0.005          # 适度降低剪枝强度
-    min_samples_leaf: 2       # 适中，减少过拟合但不影响表现
-
-  # ------------------- CatBoost 参数 (优化学习率，提高泛化) -------------------
   catboost_params:
-    iterations: 500           # 增加迭代次数，提高表现
-    learning_rate: 0.03       # 学习率适当回升，避免训练不足
-    depth: 10                  # 维持较优深度
     random_seed: 42
-    l2_leaf_reg: 9.0          # 适度降低 L2 正则，提高表达能力
-
-  # ------------------- XGBoost 参数 (优化正则化，提升表现) -------------------
+    early_stopping_rounds: 50
   xgb_params:
-    n_estimators: 400         # 增加基学习器数量，提高泛化能力
-    learning_rate: 0.03       # 降低学习率，减少过拟合
-    max_depth: 6              # 适当降低深度，提高泛化能力
     random_seed: 42
-    reg_alpha: 0.9            # 增加 L1 正则，防止过拟合
-    reg_lambda: 1.7           # 适度降低 L2 正则，提高模型表现
+    early_stopping_rounds: 50
 
-
+# 损失函数配置（主要用于深度学习模型）
 loss:
   type: "mse"
 
+# 训练配置
 training:
   log_interval: 5
 
+# 评估配置
 evaluation:
-  save_loss_curve: true
-  save_scatter_mse_plot: true
-  save_scatter_mae_plot: true
-  save_residual_hist: true
-  save_residual_kde: true
-  save_heatmap: true
-#  save_partial_dependence: false
-  save_correlation: true
-  save_feature_importance_bar: true
-  save_models_evaluation_bar: true
-  # ★ 新增: 是否画数据分析可视化(比如KDE,散点,盒须图等)
-  save_data_analysis_plots: true
+  save_loss_curve: true #一会改回来
+  save_scatter_with_marginals_plot: true
+  save_correlation: true #一会改回来
+  save_models_evaluation_bar: true #一会改回来
+  save_data_analysis_plots: true #一会改回来
+  do_cross_validation: true      # 是否进行 KFold 交叉验证
+  save_shap: true #一会改回来
+  save_multi_model_residual_plot: true #一会改回来
+  save_optuna: true #一会改回来
 
-# ★ 新增: inference 配置
+# 推断相关（不作修改）
 inference:
-  # 指定推理时要用哪些模型(可能与训练时不同)
-  models: [ "ANN", "CatBoost", "XGB"]   # 例如只想推理这两个
-  max_combinations: 200           # 若分类组合数 > 20, 则截断简化
-  # 你也可以加 output_dir, 但下面逻辑里我们自动放在 <csv_name>/inference/<model_type> 下
-
-  # 2D Heatmap 相关
-  heatmap_axes:
-    x_name: "Potential (V vs. RHE)"
-    y_name: "Particle size (nm)"
-
-  # Confusion-like 相关
+  models: ["ANN", "CatBoost", "XGB"]
+  max_combinations: 200
+  n_points: 50                 # ← 原来就有的话保留
+  heatmap_axes: # ← 统一写这里，长度决定维度
+    - "Temperature (°C)"
+    - "GHSV (mL/g.h) (LN scale)"
+    - "Pressure (bar)"         # ✱ 写两个变量就只画 2D；写三个就自动 2D×3 + 3D
   confusion_axes:
-    row_name: "Active metal"
-    col_name: "Shape"
+    row_name: "Promoter 1"
+    col_name: "Type of sysnthesis procedure"
+
+# Optuna 调参配置
+optuna:
+  overfit_penalty_alpha: 0.0
+  enable: false
+  trials: 800
+  models: ["RF", "CatBoost", "DT", "ANN", "XGB"]
+  slice_params:
+    ANN: ["hidden_dims", "learning_rate", "dropout", "weight_decay", "batch_size"]
+    RF: ["n_estimators", "max_depth", "ccp_alpha"]
+    DT: ["max_depth", "ccp_alpha"]
+    CatBoost: ["iterations", "learning_rate", "depth", "l2_leaf_reg"]
+    XGB: ["n_estimators", "learning_rate", "max_depth", "reg_alpha", "reg_lambda"]
+  ann_params:
+    hidden_dims_choices:
+      - [8, 8]
+      - [16, 16]
+      - [8, 16, 8]
+      - [16, 32, 16]
+      - [16, 64, 16]
+      - [16, 32, 32, 16]
+      - [16, 32, 64, 32, 16]
+    dropout_min: 0.0
+    dropout_max: 0.1
+    learning_rate_min: 1e-5
+    learning_rate_max: 1e-2
+    weight_decay_min: 1e-6
+    weight_decay_max: 5e-4
+    batch_size_choices: [64, 128, 256]
+    optimizer_choices: ["AdamW"]
+    activation_choices: ["ReLU", "leakyrelu"]
+    tuning_epochs: 500
+    early_stopping: true
+    patience: 5
+    log_interval: 5
+  rf_params:
+    n_estimators_min: 50
+    n_estimators_max: 300
+    max_depth_min: 2
+    max_depth_max: 12
+    ccp_alpha_min: 0.0
+    ccp_alpha_max: 0.03
+    min_samples_leaf_min: 1
+    min_samples_leaf_max: 9
+  dt_params:
+    max_depth_min: 4
+    max_depth_max: 12
+    ccp_alpha_min: 0.0
+    ccp_alpha_max: 0.03
+  catboost_params:
+    iterations_min: 200
+    iterations_max: 1000
+    learning_rate_min: 0.01
+    learning_rate_max: 0.1
+    depth_min: 4
+    depth_max: 12
+    l2_leaf_reg_min: 1.0
+    l2_leaf_reg_max: 5.0
+  xgb_params:
+    n_estimators_min: 100
+    n_estimators_max: 500
+    learning_rate_min: 0.01
+    learning_rate_max: 0.1
+    max_depth_min: 3
+    max_depth_max: 10
+    reg_alpha_min: 1e-8
+    reg_alpha_max: 1e-4
+    reg_lambda_min: 1.0
+    reg_lambda_max: 3.0

@@ -10,7 +10,7 @@ visualization.py
      => 画散点、残差、MAE、MSE、Loss曲线、FeatureImportance(若有)
 2) 从 postprocessing/<csv_name>/inference/<model_type> 读取:
    - heatmap_pred.npy, grid_x.npy, grid_y.npy => 2D heatmap
-   - confusion_pred.npy => confusion-like
+   - confusion_pred_norm.npy => confusion-like
 3) 输出图到 ./evaluation/figures/<csv_name>/...
 4) 已去掉 K-Fold 逻辑.
 """
@@ -20,35 +20,204 @@ import yaml
 import numpy as np
 import pandas as pd
 import joblib
+import optuna
 
 from utils import (
     ensure_dir,
-    # phik correlation
-    plot_mixed_correlation_heatmap,
+    get_root_model_dir,
+    get_model_dir,
+    # mic correlation
+    plot_mic_network_heatmap,
+    safe_filename,
     # data analysis
     plot_kde_distribution,
-    plot_catalyst_size_vs_product,
-    plot_potential_vs_product_by_electrolyte,
-    plot_product_distribution_by_catalyst_and_potential,
-    plot_product_vs_potential_bin,
-    plot_product_vs_shape,
-    plot_product_vs_catalyst,
-    plot_potential_vs_product,
     # model metrics
-    plot_three_metrics_horizontal,
+    plot_cv_metrics,
+    plot_cv_boxplot,
     plot_overfitting_horizontal,
     plot_loss_curve,
-    plot_scatter_3d_outputs_mse,
-    plot_scatter_3d_outputs_mae,
-    plot_residual_histogram,
-    plot_residual_kde,
-    plot_rf_feature_importance_bar,
+    plot_joint_scatter_with_marginals,
+    merge_onehot_shap,
+    plot_shap_combined,
+    plot_shap_importance_multi_output,
+    plot_local_shap_force,
+    plot_local_shap_lines,
+    plot_shap_heatmap_local,
+    plot_multi_model_residual_distribution_single_dim,
     # inference
     plot_2d_heatmap_from_npy,
     plot_confusion_from_npy,
     plot_3d_surface_from_heatmap,
-    plot_3d_bars_from_confusion
+    plot_3d_bars_from_confusion,
+    plot_3d_surface_from_3d_heatmap,
+    # optuna
+    plot_optuna_tuning_curve,
+    plot_optuna_summary_curve,
+    plot_optuna_slice,
+    plot_optuna_param_importances
 )
+
+def _find_group_idx(keyword, groups, colnames):
+    kw = keyword.lower()
+    for idx, grp in enumerate(groups):
+        if any(kw in colnames[c].lower() for c in grp):
+            return idx
+    return None
+
+
+def generate_shap_plots(csv_name, model_types, top_n):
+    """
+    从 shap_data.pkl 生成各种 SHAP 图；已插入 one-hot 合并逻辑
+    """
+    # ==== 载入 metadata，只做一次 ====
+    meta_path = os.path.join(get_root_model_dir(csv_name), "metadata.pkl")
+    meta_data = joblib.load(meta_path)
+    onehot_groups = meta_data["onehot_groups"]
+    orig_case_map = {c.lower(): c for c in meta_data["x_col_names"]}
+
+    for mtype in model_types:
+        shap_dir = os.path.join("./evaluation/figures", csv_name, "model_comparison",
+                                mtype, "shap")
+        ensure_dir(shap_dir)
+        local_dir = os.path.join(shap_dir, "local"); ensure_dir(local_dir)
+        shap_data_path = os.path.join(shap_dir, "shap_data.pkl")
+        if not os.path.exists(shap_data_path):
+            print(f"[WARN] shap_data not found => {shap_data_path}")
+            continue
+
+        # ----- 1) 读入 & 合并 one-hot -----
+        raw_shap_data = joblib.load(shap_data_path)
+        shap_data = merge_onehot_shap(raw_shap_data,
+                                      onehot_groups=onehot_groups,
+                                      case_map=orig_case_map)   # 不想恢复大小写就传 None
+
+        # ----- 2) 全局图 -----
+        try:
+            plot_shap_combined(shap_data, shap_dir,
+                               top_n_features=top_n, plot_width=12, plot_height=8)
+            print(f"[INFO] SHAP combined plotted for {mtype}")
+        except Exception as e:
+            print(f"[WARN] combined plot failed ({mtype}): {e}")
+
+        try:
+            out_jpg = os.path.join(shap_dir, "multi_output_shap_importance.jpg")
+            plot_shap_importance_multi_output(shap_data, output_path=out_jpg,
+                                              top_n_features=top_n, plot_width=12,
+                                              plot_height=8)
+            print(f"[INFO] stacked bar plotted for {mtype}")
+        except Exception as e:
+            print(f"[WARN] stacked bar failed ({mtype}): {e}")
+
+        # ----- 3) Local 图 -----
+        outputs = (shap_data["shap_values"]
+                   if isinstance(shap_data["shap_values"], list)
+                   else [shap_data["shap_values"]])
+        y_names = shap_data.get("y_col_names",
+                                [f"Output{i}" for i in range(len(outputs))])
+
+        sample_indices = list(range(5))
+        for i, sv in enumerate(outputs):
+            local_sd = shap_data.copy()
+            local_sd["shap_values"] = sv
+            local_sd["y_col_names"] = [y_names[i]]
+
+            out_sub = local_dir if len(outputs) == 1 else \
+                      os.path.join(local_dir, safe_filename(y_names[i]))
+            ensure_dir(out_sub)
+
+            # force
+            for idx in sample_indices:
+                fn = os.path.join(out_sub, f"local_force_{idx}.jpg")
+                try:
+                    plot_local_shap_force(local_sd, idx, fn, top_n_features=top_n-6,
+                                          outputID=i)
+                except Exception as e:
+                    print(f"[WARN] force fail ({mtype}-{i}-{idx}): {e}")
+
+            # decision line
+            fn = os.path.join(out_sub, "local_line.jpg")
+            try:
+                plot_local_shap_lines(local_sd, sample_indices, fn,
+                                      top_n_features=top_n-6, outputID=i)
+            except Exception as e:
+                print(f"[WARN] line fail ({mtype}-{i}): {e}")
+
+            # heatmap
+            fn = os.path.join(out_sub, "local_heatmap.jpg")
+            try:
+                plot_shap_heatmap_local(local_sd, fn, sample_count=100,
+                                        max_display=14, outputID=i)
+            except Exception as e:
+                print(f"[WARN] heatmap fail ({mtype}-{i}): {e}")
+
+
+
+def load_optuna_trials_df(data_name, mtype):
+    """
+    根据数据名和模型类型，加载 study.pkl 并返回预处理后的 trials DataFrame；
+    对所有以 "params_" 开头的列名去除前缀。
+
+    参数：
+      data_name: 数据名称，对应文件名（不含扩展名）
+      mtype: 模型类型，对应 config["optuna"]["models"] 中的项
+
+    返回：
+      如果 study 文件存在，返回预处理后的 DataFrame，否则返回 None。
+    """
+    study_path = os.path.join("postprocessing", data_name, "optuna", mtype, "study.pkl")
+    if os.path.exists(study_path):
+        study_obj = joblib.load(study_path)
+        trials_df = study_obj.trials_dataframe()
+        trials_df.rename(
+            columns=lambda x: x.replace("params_", "") if x.startswith("params_") else x,
+            inplace=True
+        )
+        return trials_df
+    else:
+        print(f"[WARN] No study file for {mtype}")
+        return None
+
+
+def plot_optuna_results(config):
+    """
+    针对 config["optuna"]["models"] 中的每个模型，
+    从 postprocessing/<csv_name>/optuna/<model>/study.pkl 中加载调参 study 对象，
+    调用各工具函数生成调参图表，保存到 evaluation/figures/<csv_name>/optuna/<model>/ 下，
+    同时生成汇总图。
+    """
+    import os, joblib
+    csv_name = os.path.splitext(os.path.basename(config["data"]["path"]))[0]
+    dest_optuna = os.path.join("evaluation", "figures", csv_name, "optuna")
+    ensure_dir(dest_optuna)
+
+    # 保存单个模型的绘图结果前，也建立一个字典来保存各模型的 trials_df
+    trials_dict = {}
+
+    for mtype in config["optuna"]["models"]:
+        trials_df = load_optuna_trials_df(csv_name, mtype)
+        if trials_df is not None:
+            trials_dict[mtype] = trials_df
+            model_optuna_dir = os.path.join(dest_optuna, mtype)
+            ensure_dir(model_optuna_dir)
+
+            # 调参历史曲线
+            out_history = os.path.join(model_optuna_dir, "optimization_history.jpg")
+            plot_optuna_tuning_curve(trials_df, out_history)
+
+            # 获取 slice 参数列表，并生成 slice 图
+            model_slice_params = config["optuna"].get("slice_params", {}).get(mtype, [])
+            if model_slice_params:
+                out_slice = os.path.join(model_optuna_dir, "slice.jpg")
+                plot_optuna_slice(trials_df, model_slice_params, out_slice)
+
+            # 参数重要性图
+            out_importance = os.path.join(model_optuna_dir, "param_importances.jpg")
+            plot_optuna_param_importances(trials_df, out_importance)
+
+    # 生成汇总图：只负责绘图，将 trials 数据提前准备好传入
+    out_summary = os.path.join(dest_optuna, "summary.jpg")
+    plot_optuna_summary_curve(trials_dict, out_summary)
+
 
 def visualize_main():
     with open("./configs/config.yaml", "r") as f:
@@ -56,6 +225,10 @@ def visualize_main():
 
     csv_path = config["data"]["path"]
     csv_name = os.path.splitext(os.path.basename(csv_path))[0]
+
+    # 如果配置中要求保存 optuna 相关图，则调用该函数
+    if config["evaluation"].get("save_optuna", False):
+        plot_optuna_results(config)
 
     base_train = os.path.join("postprocessing", csv_name, "train")
     if not os.path.isdir(base_train):
@@ -69,64 +242,55 @@ def visualize_main():
 
     if os.path.exists(raw_csv_path):
         df_raw_14 = pd.read_csv(raw_csv_path)
-        # phik correlation
+
         if config["evaluation"].get("save_correlation", False):
             fn1 = os.path.join(data_corr_dir, "correlation_heatmap.jpg")
-            numeric_cols_14 = df_raw_14.select_dtypes(include=[np.number]).columns.tolist()
-            plot_mixed_correlation_heatmap(
+            plot_mic_network_heatmap(
                 df_raw_14,
                 filename=fn1,
-                cmap="ocean",
-                vmin=-1, vmax=1
+                method="mic",
+                dpi=700
             )
 
         # 数据分析图
         if config["evaluation"].get("save_data_analysis_plots", False):
-            possible_cols = ["Potential (V vs. RHE)", "H2", "CO", "C1", "C2+", "Particle size (nm)"]
+            possible_cols = ["Molar ratio (Zn:Cu)",
+                             "Promoter 1 ratio (Promoter 1:Cu)",
+                             "Promoter 2 ratio (Promoter 2:Cu)",
+                             "Catalyst surface area (m2/g) (LN scale)",
+                             "Calcination temperature (°C)",
+                             "GHSV (mL/g.h) (LN scale)",
+                             "Temperature (°C)",
+                             "Pressure (bar)",
+                             "H2/CO2 ratio (-)",
+                             "GHSV (mL/g.h)",
+                             "Catalyst loading (g)",
+                             "Methanol selectivity (%)",
+                             "CO2 conversion efficiency (%)",
+                             "STY_CH3OH (g/kg·h) (LN scale)",
+                             "CO selectivity (%)"]
             existing_cols = [c for c in possible_cols if c in df_raw_14.columns]
             if existing_cols:
                 out_kde = os.path.join(data_corr_dir, "kde_distribution.jpg")
                 plot_kde_distribution(df_raw_14, existing_cols, filename=out_kde)
-
-            out_cat = os.path.join(data_corr_dir, "catalyst_size_vs_product.jpg")
-            plot_catalyst_size_vs_product(df_raw_14, filename=out_cat)
-
-            out_pp = os.path.join(data_corr_dir, "potential_vs_product_by_electrolyte.jpg")
-            plot_potential_vs_product_by_electrolyte(df_raw_14, filename=out_pp)
-
-            out_prod = os.path.join(data_corr_dir, "product_distribution.jpg")
-            plot_product_distribution_by_catalyst_and_potential(df_raw_14, filename=out_prod)
-
-            out_box_pot = os.path.join(data_corr_dir, "box_product_vs_potential_bin.jpg")
-            plot_product_vs_potential_bin(df_raw_14, filename=out_box_pot)
-
-            out_box_shape = os.path.join(data_corr_dir, "box_product_vs_shape.jpg")
-            plot_product_vs_shape(df_raw_14, filename=out_box_shape)
-
-            out_box_cat = os.path.join(data_corr_dir, "box_product_vs_catalyst.jpg")
-            plot_product_vs_catalyst(df_raw_14, filename=out_box_cat)
-
-            out_three = os.path.join(data_corr_dir, "three_dot_potential_vs_product.jpg")
-            plot_potential_vs_product(df_raw_14, filename=out_three)
     else:
         print(f"[WARN] df_raw_14.csv not found => {raw_csv_path}")
 
-    # ========== 1.2) OneHot => 用 Phik ==========
-    x_onehot_path = os.path.join(base_train, "X_onehot.npy")
-    x_onehot_colnames_path = os.path.join(base_train, "x_onehot_colnames.npy")
-    if os.path.exists(x_onehot_path) and os.path.exists(x_onehot_colnames_path):
-        X_onehot = np.load(x_onehot_path)
-        onehot_colnames = np.load(x_onehot_colnames_path, allow_pickle=True).tolist()
+    # ========== 额外：绘制 K-Fold CV 指标对比图 ==========
+    cv_metrics_path = os.path.join(base_train, "cv_metrics.pkl")
+    if os.path.exists(cv_metrics_path):
+        cv_metrics = joblib.load(cv_metrics_path)
 
-        df_onehot = pd.DataFrame(X_onehot, columns=onehot_colnames)
+        # —— 原先的 4‑panel 框图 ——
+        out_cv = os.path.join(data_corr_dir, "cv_metrics_comparison.jpg")
+        plot_cv_metrics(cv_metrics, save_name=out_cv, show_label=False)
 
-        fn2 = os.path.join(data_corr_dir, "correlation_heatmap_one_hot.jpg")
-        plot_mixed_correlation_heatmap(
-            df_onehot,
-            filename=fn2,
-            cmap="ocean",
-            vmin=-1, vmax=1
-        )
+        # —— 新增：小提琴 (验证性能 + 过拟合) ——
+        out_box_mse = os.path.join(data_corr_dir, "cv_box_MSE.jpg")
+        plot_cv_boxplot(cv_metrics, metric="MSE", save_name=out_box_mse)
+        out_box_r2 = os.path.join(data_corr_dir, "cv_box_R2.jpg")
+        plot_cv_boxplot(cv_metrics, metric="R2", save_name=out_box_r2)
+        print(f"[INFO] CV box plots saved => {out_box_mse}, {out_box_r2}")
 
     # ========== 1.3) Y_train.npy, Y_val.npy ==========
     y_train_path = os.path.join(base_train, "Y_train.npy")
@@ -143,8 +307,10 @@ def visualize_main():
             continue
 
         metrics_pkl = os.path.join(model_subdir, "metrics.pkl")
-        train_pred_path = os.path.join(model_subdir, "train_pred.npy")
-        val_pred_path = os.path.join(model_subdir, "val_pred.npy")
+        train_pred_path_raw = os.path.join(model_subdir, "train_pred_raw.npy")
+        val_pred_path_raw = os.path.join(model_subdir, "val_pred_raw.npy")
+        train_pred_path_std = os.path.join(model_subdir, "train_pred_std.npy")
+        val_pred_path_std = os.path.join(model_subdir, "val_pred_std.npy")
         train_loss_path = os.path.join(model_subdir, "train_losses.npy")
         val_loss_path = os.path.join(model_subdir, "val_losses.npy")
 
@@ -152,17 +318,19 @@ def visualize_main():
         val_metrics = None
         if os.path.exists(metrics_pkl):
             data_ = joblib.load(metrics_pkl)
-            train_metrics = data_.get("train_metrics", None)
-            val_metrics = data_.get("val_metrics", None)
+            train_metrics = data_.get("mixed", {}).get("train", None)
+            val_metrics = data_.get("mixed", {}).get("val", None)
             print(f"[{mtype}] train_metrics={train_metrics}, val_metrics={val_metrics}")
 
-        train_pred = np.load(train_pred_path) if os.path.exists(train_pred_path) else None
-        val_pred = np.load(val_pred_path) if os.path.exists(val_pred_path) else None
+        # ---- 读取预测（直接用反标准化后的 RAW 量纲） ----
+        train_pred = np.load(train_pred_path_raw) if os.path.exists(train_pred_path_raw) else None
+        val_pred = np.load(val_pred_path_raw) if os.path.exists(val_pred_path_raw) else None
+
         train_losses = np.load(train_loss_path) if os.path.exists(train_loss_path) else None
         val_losses = np.load(val_loss_path) if os.path.exists(val_loss_path) else None
 
         # 读取 y_col_names (若存在)
-        model_dir = os.path.join("./models", mtype)
+        model_dir = get_model_dir(csv_name, mtype)
         ycol_path = os.path.join(model_dir, "y_col_names.npy")
         if os.path.exists(ycol_path):
             y_cols = list(np.load(ycol_path, allow_pickle=True))
@@ -176,63 +344,19 @@ def visualize_main():
         if train_losses is not None and val_losses is not None and config["evaluation"].get("save_loss_curve", False):
             out_lc = os.path.join(model_comp_dir, f"{mtype}_loss_curve.jpg")
             plot_loss_curve(train_losses, val_losses, filename=out_lc)
-
-        # (b) 绘制散点 & 残差
+        # (b) 绘制散点 & 残差、MAE、MSE
         if (Y_train is not None and Y_val is not None) and (train_pred is not None and val_pred is not None):
-            if config["evaluation"].get("save_scatter_mse_plot", False):
-                out_mse_tr = os.path.join(model_comp_dir, "full", "train", f"{mtype}_mse_scatter_train.jpg")
-                ensure_dir(os.path.dirname(out_mse_tr))
-                plot_scatter_3d_outputs_mse(Y_train, train_pred, y_labels=y_cols, filename=out_mse_tr)
-
-                out_mse_val = os.path.join(model_comp_dir, "full", "valid", f"{mtype}_mse_scatter.jpg")
-                ensure_dir(os.path.dirname(out_mse_val))
-                plot_scatter_3d_outputs_mse(Y_val, val_pred, y_labels=y_cols, filename=out_mse_val)
-
-            if config["evaluation"].get("save_scatter_mae_plot", False):
-                out_mae_tr = os.path.join(model_comp_dir, "full", "train", f"{mtype}_mae_scatter_train.jpg")
+            if config["evaluation"].get("save_scatter_with_marginals_plot", False):
+                out_mae_tr = os.path.join(model_comp_dir, "full", "train", f"{mtype}_scatter_with_marginals_train.jpg")
                 ensure_dir(os.path.dirname(out_mae_tr))
-                plot_scatter_3d_outputs_mae(Y_train, train_pred, y_labels=y_cols, filename=out_mae_tr)
-
-                out_mae_val = os.path.join(model_comp_dir, "full", "valid", f"{mtype}_mae_scatter.jpg")
+                plot_joint_scatter_with_marginals(Y_train, train_pred, y_labels=y_cols, filename=out_mae_tr)
+                out_mae_val = os.path.join(model_comp_dir, "full", "valid", f"{mtype}_scatter_with_marginals_valid.jpg")
                 ensure_dir(os.path.dirname(out_mae_val))
-                plot_scatter_3d_outputs_mae(Y_val, val_pred, y_labels=y_cols, filename=out_mae_val)
-
-            if config["evaluation"].get("save_residual_hist", False):
-                out_hist_tr = os.path.join(model_comp_dir, "full", "train", f"{mtype}_residual_hist_train.jpg")
-                ensure_dir(os.path.dirname(out_hist_tr))
-                plot_residual_histogram(Y_train, train_pred, y_labels=y_cols, filename=out_hist_tr)
-
-                out_hist_val = os.path.join(model_comp_dir, "full", "valid", f"{mtype}_residual_hist.jpg")
-                ensure_dir(os.path.dirname(out_hist_val))
-                plot_residual_histogram(Y_val, val_pred, y_labels=y_cols, filename=out_hist_val)
-
-            if config["evaluation"].get("save_residual_kde", False):
-                out_kde_tr = os.path.join(model_comp_dir, "full", "train", f"{mtype}_residual_kde_train.jpg")
-                ensure_dir(os.path.dirname(out_kde_tr))
-                plot_residual_kde(Y_train, train_pred, y_labels=y_cols, filename=out_kde_tr)
-
-                out_kde_val = os.path.join(model_comp_dir, "full", "valid", f"{mtype}_residual_kde.jpg")
-                ensure_dir(os.path.dirname(out_kde_val))
-                plot_residual_kde(Y_val, val_pred, y_labels=y_cols, filename=out_kde_val)
-
-        # (c) 特征重要度
-        if config["evaluation"].get("save_feature_importance_bar", False):
-            fi_path = os.path.join(model_subdir, "feature_importance.npy")
-            xcol_path = os.path.join(model_subdir, "x_col_names.npy")
-
-            if os.path.exists(fi_path) and os.path.exists(xcol_path):
-                feature_importances = np.load(fi_path)
-                x_col_names = list(np.load(xcol_path, allow_pickle=True))
-
-                out_fi = os.path.join(model_comp_dir, f"{mtype}_feature_importance.jpg")
-                plot_rf_feature_importance_bar(feature_importances=feature_importances,
-                                               feature_names=x_col_names,
-                                               filename=out_fi)
-                print(f"[INFO] Feature importance plotted => {out_fi}")
-            else:
-                print(f"[WARN] Feature importance file missing: {fi_path} or {xcol_path}")
-
-    # ========== 2) 汇总多个模型的 metrics ==========
+                plot_joint_scatter_with_marginals(Y_val, val_pred, y_labels=y_cols, filename=out_mae_val)
+        # ========== 2) 汇总多个模型的 metrics ==========
+        # 此部分后面会统一绘制对比图
+        # 保存模型对比指标在 cv_metrics.pkl 中（由 train.py 保存），此处调用 cv_metrics 绘图函数
+    # (d) 绘制多模型对比指标图
     train_metrics_dict = {}
     val_metrics_dict = {}
     for mtype in model_types:
@@ -240,18 +364,18 @@ def visualize_main():
         mpkl = os.path.join(mdir, "metrics.pkl")
         if os.path.exists(mpkl):
             data_ = joblib.load(mpkl)
-            train_metrics_dict[mtype] = data_.get("train_metrics", {})
-            val_metrics_dict[mtype] = data_.get("val_metrics", {})
+            train_metrics_dict[mtype] = data_.get("mixed", {}).get("train", {})
+            val_metrics_dict[mtype] = data_.get("mixed", {}).get("val", {})
 
     if train_metrics_dict or val_metrics_dict:
         if train_metrics_dict:
             out_3train = os.path.join(data_corr_dir, "three_metrics_horizontal_train.jpg")
-            plot_three_metrics_horizontal(train_metrics_dict, save_name=out_3train)
-
+            plot_cv_metrics(train_metrics_dict, save_name=out_3train,show_label=False)
+            print(f"[INFO] train metrics plot saved => {out_3train}")
         if val_metrics_dict:
             out_3val = os.path.join(data_corr_dir, "three_metrics_horizontal_val.jpg")
-            plot_three_metrics_horizontal(val_metrics_dict, save_name=out_3val)
-
+            plot_cv_metrics(val_metrics_dict, save_name=out_3val,show_label=False)
+            print(f"[INFO] valid metrics plot saved => {out_3val}")
         if config["evaluation"].get("save_models_evaluation_bar", False):
             if train_metrics_dict and val_metrics_dict:
                 overfit_data = {}
@@ -261,109 +385,248 @@ def visualize_main():
                     ms_ratio = float("inf") if trm["MSE"] == 0 else vam["MSE"] / trm["MSE"]
                     r2_diff = trm["R2"] - vam["R2"]
                     overfit_data[m] = {"MSE_ratio": ms_ratio, "R2_diff": r2_diff}
-
                 out_of = os.path.join(data_corr_dir, "overfitting_single.jpg")
                 plot_overfitting_horizontal(overfit_data, save_name=out_of)
+        # ========== 3) 多模型 residual 可视化 ==========
+        if config["evaluation"].get("save_multi_model_residual_plot", False):
+            if (Y_train is not None) and (Y_val is not None):
+                y_cols = None
+                for mtype in model_types:
+                    model_dir = get_model_dir(csv_name, mtype)
+                    ycol_path = os.path.join(model_dir, "y_col_names.npy")
+                    if os.path.exists(ycol_path):
+                        y_cols = list(np.load(ycol_path, allow_pickle=True))
+                        break
+                if y_cols is None:
+                    if Y_train.ndim == 2:
+                        out_dim = Y_train.shape[1]
+                        y_cols = [f"Output_{i}" for i in range(out_dim)]
+                    else:
+                        y_cols = ["Output_0"]
+                out_dim = len(y_cols)
+                train_residuals_dicts = [dict() for _ in range(out_dim)]
+                val_residuals_dicts = [dict() for _ in range(out_dim)]
+                for mtype in model_types:
+                    model_subdir = os.path.join(base_train, mtype)
+                    train_pred_path = os.path.join(model_subdir, "train_pred_raw.npy")
+                    val_pred_path = os.path.join(model_subdir, "val_pred_raw.npy")
+                    if os.path.exists(train_pred_path) and os.path.exists(val_pred_path):
+                        train_pred = np.load(train_pred_path)
+                        val_pred = np.load(val_pred_path)
+                        for d in range(out_dim):
+                            train_residuals_dicts[d][mtype] = Y_train[:, d] - train_pred[:, d]
+                            val_residuals_dicts[d][mtype] = Y_val[:, d] - val_pred[:, d]
+                for d in range(out_dim):
+                    col_name = y_cols[d]
+                    # out_tr_fig = os.path.join("./evaluation/figures", csv_name, "model_comparison",
+                    #                            f"multi_residual_{col_name}_train.jpg")
+                    out_tr_fig = os.path.join(
+                        "./evaluation/figures",
+                        csv_name,
+                        "model_comparison",
+                        f"multi_residual_{safe_filename(col_name)}_train.jpg"
+                    )
 
-    # ========== 3) 推理可视化 (Heatmap + Confusion) ==========
+                    plot_multi_model_residual_distribution_single_dim(
+                        residuals_dict=train_residuals_dicts[d],
+                        out_label=f"{col_name} (Train)",
+                        bins=6,
+                        filename=out_tr_fig,
+                        rug_negative_space=0.13,
+                        show_zero_line_arrow=False
+                    )
+                    out_val_fig = os.path.join(
+                        "./evaluation/figures",
+                        csv_name,
+                        "model_comparison",
+                        f"multi_residual_{safe_filename(col_name)}_valid.jpg"
+                    )
+
+                    plot_multi_model_residual_distribution_single_dim(
+                        residuals_dict=val_residuals_dicts[d],
+                        out_label=f"{col_name} (Valid)",
+                        bins=6,
+                        filename=out_val_fig,
+                        rug_negative_space=0.13,
+                        show_zero_line_arrow=False
+                    )
+                print("[INFO] => Multi-model residual distribution plots done.")
+            else:
+                print("[WARN] => Y_train / Y_val not found, skip multi-model residual distribution.")
+        # ========== 4) SHAP 可解释性图 ==========
+        if config["evaluation"].get("save_shap", False):
+            inp_len = int(config["data"]["input_len"])
+            generate_shap_plots(csv_name, model_types,top_n=inp_len)
+
+    # ========== 5) 推理可视化 (Heatmap + Confusion) ==========
     base_inf = os.path.join("postprocessing", csv_name, "inference")
     inf_models = config["inference"].get("models", [])
-
-    # 从 metadata.pkl 中读取 stats_dict["continuous_cols"]
-    metadata_path = os.path.join("./models", "metadata.pkl")
+    metadata_path = os.path.join(get_root_model_dir(csv_name), "metadata.pkl")
     if os.path.exists(metadata_path):
         meta_data = joblib.load(metadata_path)
         stats_dict = meta_data.get("continuous_cols", {})
     else:
         stats_dict = {}
+    axes_names = config["inference"].get("heatmap_axes", [])
+    heatmap_x_label = axes_names[0] if len(axes_names) >= 1 else "X-axis"
+    heatmap_y_label = axes_names[1] if len(axes_names) >= 2 else "Y-axis"
+    heatmap_z_label = axes_names[2] if len(axes_names) >= 3 else "Z-axis"
 
-    # 读取 config
-    heatmap_x_label = config["inference"]["heatmap_axes"]["x_name"]
-    heatmap_y_label = config["inference"]["heatmap_axes"]["y_name"]
     confusion_row_axis = config["inference"]["confusion_axes"]["row_name"]
     confusion_col_axis = config["inference"]["confusion_axes"]["col_name"]
+    # —— 每个模型的 2-D 组合重新从 0 编号 ——
 
     for mtype in inf_models:
+        combo_id = -1
         inf_dir = os.path.join(base_inf, mtype)
         if not os.path.isdir(inf_dir):
             print(f"[WARN] no inference dir => {inf_dir}")
             continue
-
-        heatmap_path = os.path.join(inf_dir, "heatmap_pred.npy")
-        gridx_path   = os.path.join(inf_dir, "grid_x.npy")
-        gridy_path   = os.path.join(inf_dir, "grid_y.npy")
-        confusion_path = os.path.join(inf_dir, "confusion_pred.npy")
-
+        # >>>>>>> 这三行是修复重点  <<<<<<<<
         base_out = os.path.join("./evaluation/figures", csv_name, "inference", mtype)
         ensure_dir(base_out)
+        confusion_path = os.path.join(inf_dir, "confusion_pred_norm.npy")
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+        # --------------------------------------------------------------
+        # A) 处理所有带 heatmap_pred_* 的 2-D 文件
+        # --------------------------------------------------------------
+        file_list = os.listdir(inf_dir)
+        for fname in file_list:
+            if not (fname.startswith("heatmap_pred_") and fname.endswith(".npy")
+                    and "3d" not in fname):
+                continue
 
-        # Heatmap
-        if os.path.exists(heatmap_path) and os.path.exists(gridx_path) and os.path.exists(gridy_path):
-            heatmap_pred = np.load(heatmap_path)
-            grid_x = np.load(gridx_path)
-            grid_y = np.load(gridy_path)
+            # ---------- 读取 grid ----------
+            tag = fname[len("heatmap_pred_"):-4]  # 可能是 “Temp__GHSV” 或乱名
+            gx = os.path.join(inf_dir, f"grid_x_{tag}.npy")
+            gy = os.path.join(inf_dir, f"grid_y_{tag}.npy")
+            if not (os.path.exists(gx) and os.path.exists(gy)):
+                continue
 
-            model_dir = os.path.join("./models", mtype)
-            ycol_path = os.path.join(model_dir, "y_col_names.npy")
-            if os.path.exists(ycol_path):
-                y_cols = list(np.load(ycol_path, allow_pickle=True))
-            else:
-                y_cols = None
+            heatmap_pred = np.load(os.path.join(inf_dir, fname))
+            grid_x, grid_y = np.load(gx), np.load(gy)
 
-            out_hm = os.path.join(base_out, "2d_heatmap")
-            ensure_dir(out_hm)
+            # ---------- 生成 comb 目录 ----------
+            combo_id += 1
+            folder_name = f"comb{combo_id}"
+            tag_dir = os.path.join(base_out, "2d_heatmap", folder_name)
+            map_dir = os.path.join(tag_dir, "map")
+            surf_dir = os.path.join(tag_dir, "surface")
+            ensure_dir(map_dir);
+            ensure_dir(surf_dir)
 
+            # ---------- 解析轴标签 ----------
+            parts = tag.split("__")
+            if len(parts) == 2 and all(parts):
+                xlab_raw, ylab_raw = parts
+            else:  # 解析失败 -> 用 config 里的默认
+                xlab_raw, ylab_raw = heatmap_x_label, heatmap_y_label
+            xlab = xlab_raw.replace("_", " ")
+            ylab = ylab_raw.replace("_", " ")
+
+            # 把真实轴信息写 info.txt，便于追溯
+            info_txt = os.path.join(tag_dir, "info.txt")
+            if not os.path.exists(info_txt):
+                with open(info_txt, "w", encoding="utf8") as f:
+                    f.write(f"X-axis : {xlab_raw}\nY-axis : {ylab_raw}\n")
+
+            # ---------- 输出变量名 ----------
+            y_cols = None
+            yp = os.path.join(get_model_dir(csv_name, mtype), "y_col_names.npy")
+            if os.path.exists(yp):
+                y_cols = list(np.load(yp, allow_pickle=True))
+
+            # ---------- (a) 2-D 热力图 ----------
             plot_2d_heatmap_from_npy(
                 grid_x, grid_y, heatmap_pred,
-                out_dir=out_hm,
-                x_label=heatmap_x_label,
-                y_label=heatmap_y_label,
+                out_dir=map_dir,
+                x_label=xlab, y_label=ylab,
                 y_col_names=y_cols,
-                # stats_dict=stats_dict,
-                colorbar_extend_ratio=0.02
-            )
+                colorbar_extend_ratio=0.02)
 
-            # 3D Surface
+            # ---------- (b) 局部 3-D 曲面 ----------
             plot_3d_surface_from_heatmap(
                 grid_x, grid_y, heatmap_pred,
-                out_dir=out_hm,
-                x_label=heatmap_x_label,
-                y_label=heatmap_y_label,
+                out_dir=surf_dir,
+                x_label=xlab, y_label=ylab,
                 y_col_names=y_cols,
-                # stats_dict=stats_dict,
                 colorbar_extend_ratio=0.02,
-                cmap_name="viridis"
-            )
+                cmap_name="GnBu")
 
-        # Confusion
+        # --------------------------------------------------------------
+        # B) 整体三变量 3-D：半透明曲面
+        # --------------------------------------------------------------
+        hp3d = os.path.join(inf_dir, "heatmap_pred_3d.npy")
+        gx3d = os.path.join(inf_dir, "grid_x_3d.npy")
+        gy3d = os.path.join(inf_dir, "grid_y_3d.npy")
+        gz3d = os.path.join(inf_dir, "grid_z_3d.npy")
+
+        if all(os.path.exists(p) for p in [hp3d, gx3d, gy3d, gz3d]):
+            heatmap_pred_3d = np.load(hp3d)
+            grid_x_3d, grid_y_3d, grid_z_3d = (
+                np.load(gx3d), np.load(gy3d), np.load(gz3d))
+
+            # 读取 y_col_names（如有）
+            y_cols = None
+            yp = os.path.join(get_model_dir(csv_name, mtype), "y_col_names.npy")
+            if os.path.exists(yp):
+                y_cols = list(np.load(yp, allow_pickle=True))
+
+            overall_dir = os.path.join(base_out, "3d_surface_overall")
+            ensure_dir(overall_dir)
+
+            out_dim = heatmap_pred_3d.shape[-1]
+            for d in range(out_dim):
+                # --- 半透明层-曲面 ---
+                plot_3d_surface_from_3d_heatmap(
+                    grid_x_3d, grid_y_3d, grid_z_3d, heatmap_pred_3d,
+                    out_dir=overall_dir,
+                    axes_labels=(heatmap_x_label, heatmap_y_label, heatmap_z_label),
+                    y_col_names=y_cols,
+                    out_idx=d,
+                    alpha_mode="value",  # 或 "inverse"
+                    alpha_gamma=2  # γ 越大 → 高值更突出
+                )
+
+        # --------------------------------------------------------------
+        # 读取 confusion_pred_norm.npy  →  画 confusion-like 图
+        # --------------------------------------------------------------
         if os.path.exists(confusion_path):
             confusion_pred = np.load(confusion_path)
 
-            meta_path = os.path.join("./models", "metadata.pkl")
-            if os.path.exists(meta_path):
-                meta_data2 = joblib.load(meta_path)
-                oh_groups = meta_data2.get("onehot_groups", [])
-            else:
-                oh_groups = []
+            # ① metadata：拿到 one-hot 组 & x 列名
+            meta_path = os.path.join(get_root_model_dir(csv_name), "metadata.pkl")
+            meta = joblib.load(meta_path)
+            oh_groups = meta["onehot_groups"]  # List[List[int]]
 
-            if len(oh_groups) >= 2:
-                grpA, grpB = oh_groups[:2]
+            xcol_path = os.path.join(get_model_dir(csv_name, mtype), "x_col_names.npy")
+            xcols = list(np.load(xcol_path, allow_pickle=True))
 
-                xcol_path = os.path.join("./models", mtype, "x_col_names.npy")
-                if os.path.exists(xcol_path):
-                    xcols = list(np.load(xcol_path, allow_pickle=True))
+            if len(oh_groups) >= 2:  # ←—— 这里保留 !
+                # ② 根据 config 关键字，确定行 / 列用哪两个组
+                row_kw = config["inference"]["confusion_axes"]["row_name"]
+                col_kw = config["inference"]["confusion_axes"]["col_name"]
+
+                row_idx = _find_group_idx(row_kw, oh_groups, xcols)
+                col_idx = _find_group_idx(col_kw, oh_groups, xcols)
+
+                if (row_idx is None) or (col_idx is None):
+                    print("[WARN] 找不到关键字对应的 one-hot 组，退回前两组。")
+                    grpA, grpB = oh_groups[:2]
+                elif row_idx == col_idx:
+                    raise ValueError("row_name 与 col_name 落在同一个 one-hot 组，请检查 config.")
                 else:
-                    xcols = None
+                    grpA, grpB = oh_groups[row_idx], oh_groups[col_idx]
 
-                row_labels = [xcols[cid] for cid in grpA] if xcols else [f"Class {i+1}" for i in range(len(grpA))]
-                col_labels = [xcols[cid] for cid in grpB] if xcols else [f"Class {i+1}" for i in range(len(grpB))]
+                # ③ 生成行/列标签
+                row_labels = [xcols[cid] for cid in grpA]
+                col_labels = [xcols[cid] for cid in grpB]
 
-                ycol_path = os.path.join("./models", mtype, "y_col_names.npy")
-                if os.path.exists(ycol_path):
-                    y_cols = list(np.load(ycol_path, allow_pickle=True))
-                else:
-                    y_cols = None
+                # ④ 读取输出标签（可选）
+                ycol_path = os.path.join(get_model_dir(csv_name, mtype), "y_col_names.npy")
+                y_cols = list(np.load(ycol_path, allow_pickle=True)) if os.path.exists(ycol_path) else None
 
+                # ⑤ 开始绘图
                 out_conf = os.path.join(base_out, "confusion_matrix")
                 ensure_dir(out_conf)
 
@@ -372,11 +635,9 @@ def visualize_main():
                     row_labels, col_labels,
                     out_dir=out_conf,
                     y_col_names=y_cols,
-                    # stats_dict=stats_dict,
                     cell_scale=0.25,
-                    colorbar_extend_ratio=0.02,
-                    row_axis_name=confusion_row_axis,
-                    col_axis_name=confusion_col_axis
+                    row_axis_name=row_kw,
+                    col_axis_name=col_kw
                 )
 
                 plot_3d_bars_from_confusion(
@@ -384,13 +645,12 @@ def visualize_main():
                     row_labels, col_labels,
                     out_dir=out_conf,
                     y_col_names=y_cols,
-                    # stats_dict=stats_dict,
                     colorbar_extend_ratio=0.02,
-                    cmap_name="viridis"#"rainbow" "viridis"
+                    cmap_name="GnBu"
                 )
             else:
-                print("[WARN] Not enough onehot groups => skip confusion matrix.")
-
+                # one-hot 组不足 2 个
+                print("[WARN] Not enough one-hot groups ⇒ skip confusion matrix.")
     print("\n[INFO] visualize_main => done.")
 
 

@@ -28,30 +28,34 @@ def _restore_original_case(mapped_dict, lower_names):
         restored.append(orig)
     return restored
 
-def load_dataset(csv_path, drop_nan=True):
+def load_dataset(csv_path, input_len, output_len, drop_nan=True):
+    total_len = input_len + output_len
     df_raw = pd.read_csv(csv_path)
-    df = df_raw.iloc[:, :14].copy()
+    df = df_raw.iloc[:, :total_len].copy()
+
+    # 如果不想直接删除缺失值，而是用当前列的均值进行填充，
+    # 可取消下面代码的注释：
+
+    for col in df.columns:
+        if pd.api.types.is_numeric_dtype(df[col]):  # 数值型列
+            mean_val = df[col].mean(skipna=True)  # 0 计入均值
+            df[col].fillna(mean_val, inplace=True)  # 只填 NaN
+        else:  # 分类变量
+            df[col].fillna(df[col].mode()[0], inplace=True)
 
     if drop_nan:
         df.dropna(subset=df.columns, how='any', inplace=True)
 
-    if df.shape[1] < 14:
+    if df.shape[1] < total_len:
         raise ValueError("After dropping/cleaning, not enough columns (need >=14).")
 
-    # 前10列 => X, 后4列 => Y
-    X_df = df.iloc[:, :10].copy()
-    Y_df = df.iloc[:, 10:14].copy()
+    # 前13列 => X, 后4列 => Y
+    X_df = df.iloc[:, :input_len].copy()
+    Y_df = df.iloc[:, input_len:total_len].copy()
     y_col_names = list(Y_df.columns)
     Y = Y_df.values
 
-    # 可选：检查 Y 是否有 <0 或 >100
-    for i, cname in enumerate(y_col_names):
-        below0 = (Y[:, i] < 0).sum()
-        above100 = (Y[:, i] > 100).sum()
-        if below0 > 0 or above100 > 0:
-            print(f"[WARN] Y-col '{cname}' has {below0} <0, {above100} >100")
-
-    # ---- 记录原始 X 列名(仅10列)
+    # ---- 记录原始 X 列名(仅13列)
     original_x_col_names = list(X_df.columns)
 
     # ---- 区分数值列 & 分类列
@@ -74,8 +78,7 @@ def load_dataset(csv_path, drop_nan=True):
         if colname in numeric_cols_original:
             numeric_cols_idx.append(i)
 
-    x_col_names_lower = list(X_encoded.columns)  # 此时的列名是小写 + 下划线
-    # x_col_names_lower 形如 ["shape_nanowire", "shape_nanoparticle", ...]
+    x_col_names_lower = list(X_encoded.columns)  # 此时的列名是小写 + 下划
 
     # ---- 分析 one-hot 分组
     onehot_groups, oh_index_map = _extract_onehot_info(x_col_names_lower, numeric_cols_idx)
@@ -140,12 +143,23 @@ def _get_observed_onehot_combos(X, onehot_groups):
     return combos_sorted
 
 
-def load_raw_data_for_correlation(csv_path, drop_nan=True):
+def load_raw_data_for_correlation(csv_path, input_len, output_len, drop_nan=True, fill_same_as_train=True):
     """
-    如果要做混合变量相关性分析，而不想做 One-Hot，可用这个读取前14列。
+    如果要做混合变量相关性分析，而不想做 One-Hot，可用这个读取前13列。
     """
+    check_len = input_len + output_len
     df_raw = pd.read_csv(csv_path)
-    df = df_raw.iloc[:, :14].copy()
+    df = df_raw.iloc[:, :check_len].copy()
+
+    if fill_same_as_train:
+        for col in df.columns:
+            if pd.api.types.is_numeric_dtype(df[col]):
+                mean_val = df[col].mean(skipna=True)   # 0 计入均值
+                df[col].fillna(mean_val, inplace=True)
+            else:
+                if df[col].isna().any():
+                    df[col].fillna(df[col].mode()[0], inplace=True)
+
     if drop_nan:
         df.dropna(subset=df.columns, how='any', inplace=True)
     return df

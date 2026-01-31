@@ -6,6 +6,8 @@ Implements common regression metrics: MSE, MAE, R2.
 
 import numpy as np
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+# ---------- 追加：混合指标助手 ----------
+from data_preprocessing.scaler_utils import inverse_transform_output
 
 def compute_regression_metrics(y_true, y_pred):
     """
@@ -14,6 +16,11 @@ def compute_regression_metrics(y_true, y_pred):
     :param y_pred: shape (N, output_dim)
     :return: a dict with "MSE", "MAE", "R2"
     """
+    if y_true.ndim == 1:
+        y_true = y_true.reshape(-1, 1)
+    if y_pred.ndim == 1:
+        y_pred = y_pred.reshape(-1, 1)
+
     mse = mean_squared_error(y_true, y_pred)
     mae = mean_absolute_error(y_true, y_pred)
     r2  = r2_score(y_true, y_pred, multioutput='uniform_average')
@@ -21,6 +28,28 @@ def compute_regression_metrics(y_true, y_pred):
         "MSE": mse,
         "MAE": mae,
         "R2" : r2
+    }
+
+
+
+def compute_mixed_metrics(y_true_raw,
+                          y_true_std,
+                          y_pred_std,
+                          scaler_y):
+    """
+    MSE / MAE → 标准化域；  R² → 原始量纲
+    """
+    # 反标准化
+    y_pred_raw = inverse_transform_output(y_pred_std, scaler_y)
+
+    # 两套指标
+    m_std = compute_regression_metrics(y_true_std, y_pred_std)
+    m_raw = compute_regression_metrics(y_true_raw, y_pred_raw)
+
+    return {
+        "MSE": m_std["MSE"],
+        "MAE": m_std["MAE"],
+        "R2":  m_raw["R2"]
     }
 
 

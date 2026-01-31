@@ -1,6 +1,4 @@
 """
-trainers/train_torch.py
-
 Trains a PyTorch model with DataLoader, optional Early Stopping, etc.
 """
 
@@ -24,6 +22,7 @@ def train_torch_model_dataloader(model,
                                  optimizer_name="Adam"):
     """
     Train a PyTorch model using DataLoader, with optional Early Stopping & Dropout.
+    其中，训练集合的评估指标通过在评估模式下计算，以排除 Dropout 等正则化的影响。
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -45,15 +44,15 @@ def train_torch_model_dataloader(model,
     best_state = None
     best_epoch = 0
 
+    # 用于存储每个 epoch 的训练和验证指标（均在 eval 模式下计算，不受 dropout 影响）
     train_losses = []
     val_losses = []
 
     no_improve_epochs = 0
 
     for epoch in range(1, epochs + 1):
-        # ---- Training ----
+        # ---- Training (仅用于参数更新) ----
         model.train()
-        batch_loss_list = []
         for (X_batch, Y_batch) in train_loader:
             X_batch = X_batch.to(device)
             Y_batch = Y_batch.to(device)
@@ -65,12 +64,19 @@ def train_torch_model_dataloader(model,
             loss_batch.backward()
             optimizer.step()
 
-            batch_loss_list.append(loss_batch.item())
-
-        train_loss = float(np.mean(batch_loss_list))
-
-        # ---- Validation ----
+        # ---- 计算训练集"干净"的指标：关闭 dropout 及其他正则化 ----
         model.eval()
+        train_loss_list = []
+        with torch.no_grad():
+            for (X_batch, Y_batch) in train_loader:
+                X_batch = X_batch.to(device)
+                Y_batch = Y_batch.to(device)
+                pred_batch = model(X_batch)
+                loss_batch = loss_fn(pred_batch, Y_batch)
+                train_loss_list.append(loss_batch.item())
+        train_loss = float(np.mean(train_loss_list))
+
+        # ---- Validation（已经在 eval 模式下）----
         val_loss_list = []
         with torch.no_grad():
             for (X_val_b, Y_val_b) in val_loader:
@@ -79,7 +85,6 @@ def train_torch_model_dataloader(model,
                 val_pred_b = model(X_val_b)
                 loss_b = loss_fn(val_pred_b, Y_val_b)
                 val_loss_list.append(loss_b.item())
-
         val_loss = float(np.mean(val_loss_list))
 
         train_losses.append(train_loss)
