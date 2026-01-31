@@ -16,6 +16,7 @@ class XGBRegression:
                  random_state: int = 42,
                  reg_alpha: float = 0.0,
                  reg_lambda: float = 1.0,
+                 n_jobs: int = -1,
                  early_stopping_rounds: Optional[int] = None   # ← 修改
                  ):
         self.model = XGBRegressor(
@@ -26,6 +27,7 @@ class XGBRegression:
             verbosity=0,
             reg_alpha=reg_alpha,
             reg_lambda=reg_lambda,
+            n_jobs=n_jobs,
             objective="reg:squarederror",
         )
 

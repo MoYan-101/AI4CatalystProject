@@ -49,13 +49,57 @@ from scipy.spatial.distance import pdist
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 #save pt
-def get_model_dir(csv_name: str, model_type: str) -> str:
-    """统一返回  ./models/<csv_name>/<model_type>  目录"""
-    return os.path.join("./models", csv_name, model_type)
+def _resolve_run_id(run_id: str | None) -> str | None:
+    rid = run_id if run_id not in (None, "") else os.environ.get("RUN_ID")
+    if rid is None:
+        return None
+    rid = str(rid).strip()
+    if not rid or rid.lower() in {"none", "null"}:
+        return None
+    return rid
 
-def get_root_model_dir(csv_name: str) -> str:
-    """返回  ./models/<csv_name>  根目录（metadata / 每类模型子目录）"""
-    return os.path.join("./models", csv_name)
+def get_run_id(config: dict | None = None) -> str | None:
+    rid = os.environ.get("RUN_ID")
+    if rid:
+        return rid
+    if config:
+        cfg_rid = config.get("run_id") or config.get("data", {}).get("run_id")
+        if cfg_rid:
+            return str(cfg_rid).strip()
+    return None
+
+def get_model_dir(csv_name: str, model_type: str, run_id: str | None = None) -> str:
+    """统一返回  ./models/<csv_name>[/<run_id>]/<model_type>  目录"""
+    rid = _resolve_run_id(run_id)
+    parts = ["./models", csv_name]
+    if rid:
+        parts.append(rid)
+    parts.append(model_type)
+    return os.path.join(*parts)
+
+def get_root_model_dir(csv_name: str, run_id: str | None = None) -> str:
+    """返回  ./models/<csv_name>[/<run_id>]  根目录（metadata / 每类模型子目录）"""
+    rid = _resolve_run_id(run_id)
+    parts = ["./models", csv_name]
+    if rid:
+        parts.append(rid)
+    return os.path.join(*parts)
+
+def get_postprocess_dir(csv_name: str, run_id: str | None = None, *parts: str) -> str:
+    rid = _resolve_run_id(run_id)
+    base = ["postprocessing", csv_name]
+    if rid:
+        base.append(rid)
+    base.extend(parts)
+    return os.path.join(*base)
+
+def get_eval_dir(csv_name: str, run_id: str | None = None, *parts: str) -> str:
+    rid = _resolve_run_id(run_id)
+    base = ["evaluation", "figures", csv_name]
+    if rid:
+        base.append(rid)
+    base.extend(parts)
+    return os.path.join(*base)
 
 def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
@@ -106,12 +150,13 @@ def short_label(s: str) -> str:
 }
 
 
+    s = str(s)
     parts = s.split('_')
     last_part = parts[-1]  # 取最后一段
 
     # 若最后一段是空字符串
     if not last_part:
-        return last_part  # 返回空串即可
+        return s  # 避免空标签
 
     # 先检查是否属于特例化学符号
     lower_last_part = last_part.lower()  # 转小写匹配
@@ -182,15 +227,19 @@ def plot_mic_network_heatmap(feature_df: pd.DataFrame,
         return mcolors.to_hex(blend)
 
     def _mic(x: np.ndarray, y: np.ndarray) -> float:
-        """MIC；若 minepy 不可用则退化为 distance‑correlation"""
+        """MIC；若 minepy 不可用则退化为 distance‑correlation / Pearson"""
         try:
             from minepy import MINE
             mine = MINE(alpha=0.6, c=15)
             mine.compute_score(x, y)
             return float(mine.mic())
         except Exception:
-            import dcor
-            return float(dcor.distance_correlation(x, y))
+            try:
+                import dcor
+                return float(dcor.distance_correlation(x, y))
+            except Exception:
+                val = float(np.corrcoef(x, y)[0, 1])
+                return 0.0 if np.isnan(val) else abs(val)
 
     def _corr_matrix(df: pd.DataFrame, _method: str = "mic") -> np.ndarray:
         """计算 n×n 非线性相关矩阵（MIC 或 distance‑corr）"""
@@ -1029,22 +1078,27 @@ def plot_shap_combined(
         # -------------------------------
         fig, ax_bottom = plt.subplots(figsize=(plot_width, plot_height), dpi=700)
         try:
-            shap.plots.beeswarm(
-                explanation,
-                max_display=top_n_features,
-                color='twilight',
-                show=False,
-                ax=ax_bottom
-            )
-        except TypeError:
             plt.sca(ax_bottom)
             shap.summary_plot(
-                explanation,
+                sv_sorted,
                 features=X_sorted,
                 feature_names=feat_sorted,
                 max_display=top_n_features,
                 show=False,
-                plot_size=(plot_width, plot_height)
+                plot_size=None,
+                plot_type="dot",
+                sort=False
+            )
+        except TypeError:
+            plt.sca(ax_bottom)
+            shap.summary_plot(
+                sv_sorted,
+                features=X_sorted,
+                feature_names=feat_sorted,
+                max_display=top_n_features,
+                show=False,
+                plot_type="dot",
+                sort=False
             )
         ax_bottom.set_xlabel("SHAP Value", fontsize=12)
         ax_bottom.spines['right'].set_visible(False)
@@ -1056,14 +1110,13 @@ def plot_shap_combined(
         # -------------------------------
         ax_top = ax_bottom.twiny()  # 共享 y 轴
         ax_top.set_ylim(ax_bottom.get_ylim())
-        # 为使条形图顺序和 beeswarm 一致，
-        # 将条形图的数据反转（因为 beeswarm 已调用 invert_yaxis()）
-        bar_imps = top_imps[::-1]
-        bar_feats = feat_sorted[::-1]
-        bar_colors = colors[::-1]
-        y_index = np.arange(len(bar_imps))
+        y_labels = [t.get_text() for t in ax_bottom.get_yticklabels()]
+        y_ticks = ax_bottom.get_yticks()
+        imp_map = {feat_sorted[i]: float(top_imps[i]) for i in range(len(top_imps))}
+        bar_imps = [imp_map.get(lbl, 0.0) for lbl in y_labels]
+        bar_colors = ["blue" if v > threshold else "red" for v in bar_imps]
         ax_top.barh(
-            y=y_index,
+            y=y_ticks,
             width=bar_imps,
             color=bar_colors,
             alpha=0.15,
@@ -1074,8 +1127,9 @@ def plot_shap_combined(
         ax_top.xaxis.set_label_position('top')
         ax_top.xaxis.tick_top()
         ax_top.set_xlabel("Feature Importance", fontsize=12)
-        ax_top.set_yticks(y_index)
-        ax_top.set_yticklabels(bar_feats, fontsize=10)
+        ax_top.set_yticks(y_ticks)
+        ax_bottom.set_yticks(y_ticks)
+        ax_bottom.set_yticklabels(y_labels)
         # 注意：不再调用 invert_yaxis()在 ax_top 上
 
         # 添加图例（基于条形图所用颜色）
@@ -1840,6 +1894,8 @@ def plot_multi_model_residual_distribution_single_dim(
     model_names = list(residuals_dict.keys())
     n_models = len(model_names)
     color_palette = ["#24345C", "#279DE1", "#329845", "#8A233F", "#912C2C"]
+    if n_models > len(color_palette):
+        color_palette = color_palette * (n_models // len(color_palette) + 1)
 
     # ========== 左轴: Histogram(Count) ==========
     hist_counts_dict = {}

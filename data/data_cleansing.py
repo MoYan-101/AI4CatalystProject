@@ -1,8 +1,10 @@
+import os
 import pandas as pd
 from collections import defaultdict, deque
 
 # === 读取数据 ===
-df = pd.read_csv("Test_0611.csv")
+input_path = os.path.join(os.path.dirname(__file__), "Main_20260128.csv")
+df = pd.read_csv(input_path)
 df.columns = [c.strip() for c in df.columns]
 
 col1 = "Promoter 1"
@@ -59,9 +61,14 @@ df_clean    = df[~df["row_id"].isin(conflict_indices)].copy()
 df_clean.drop(columns="row_id", inplace=True)
 df_conflict.drop(columns="row_id", inplace=True)              # ← 新增：去掉辅助列
 
+base_name = os.path.splitext(os.path.basename(input_path))[0]
+output_dir = os.path.dirname(input_path)
+conflict_path = os.path.join(output_dir, f"{base_name}_conflict_rows.csv")
+clean_path = os.path.join(output_dir, f"{base_name}_cleansed.csv")
+
 # 另存冲突行
-df_conflict.to_csv("Test_0611_conflict_rows.csv", index=False)
-print(f"🗑️  已单独保存 {len(df_conflict)} 条冲突行至 'Test_0611_conflict_rows.csv'")
+df_conflict.to_csv(conflict_path, index=False)
+print(f"🗑️  已单独保存 {len(df_conflict)} 条冲突行至 '{conflict_path}'")
 print(f"\n✅ 删除冲突行数: {len(conflict_indices)}")
 
 # === 再次构建 promoter 图上染色，以调整列 ===
@@ -133,5 +140,5 @@ print("\nPromoter 2 中的唯一元素:")
 print(p2_all)
 
 # === 保存最终结果 ===
-df_clean.to_csv("Test_0611_cleansed.csv", index=False)
-print("\n📁 文件已保存为 'Test_0611_cleansed'")
+df_clean.to_csv(clean_path, index=False)
+print(f"\n📁 文件已保存为 '{clean_path}'")

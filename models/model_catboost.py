@@ -10,7 +10,7 @@ class CatBoostRegression:
     CatBoost with l2_leaf_reg controlling L2 regularization strength.
     """
     def __init__(self, iterations=100, learning_rate=0.1, depth=6,
-                 random_seed=42, l2_leaf_reg=3.0):
+                 random_seed=42, l2_leaf_reg=3.0, thread_count=-1):
         self.model = CatBoostRegressor(
             iterations=iterations,
             learning_rate=learning_rate,
@@ -18,7 +18,8 @@ class CatBoostRegression:
             random_seed=random_seed,
             verbose=0,
             loss_function="MultiRMSE",
-            l2_leaf_reg=l2_leaf_reg
+            l2_leaf_reg=l2_leaf_reg,
+            thread_count=thread_count
         )
 
     def fit(self, X, Y, **fit_kwargs):
@@ -65,4 +66,3 @@ class CatBoostRegression:
             if shap_values.shape[1] == X.shape[1] + 1:
                 shap_values = shap_values[:, :-1]
             return shap_values
-

@@ -2,20 +2,21 @@
 visualization.py
 
 需求:
-1) 从 postprocessing/<csv_name>/train 读取:
+1) 从 postprocessing/<csv_name>[/<run_id>]/train 读取:
    - df_raw_14.csv => 做 correlation (普通) + DataAnalysis
-   - X_onehot.npy => 做 correlation_heatmap_one_hot
+   - X_features.npy => 做 correlation_heatmap_one_hot
    - Y_train.npy, Y_val.npy => 用于画散点/残差
    - 对每个模型 => 读取 train_pred.npy, val_pred.npy, metrics.pkl, train_losses.npy, val_losses.npy
      => 画散点、残差、MAE、MSE、Loss曲线、FeatureImportance(若有)
-2) 从 postprocessing/<csv_name>/inference/<model_type> 读取:
+2) 从 postprocessing/<csv_name>[/<run_id>]/inference/<model_type> 读取:
    - heatmap_pred.npy, grid_x.npy, grid_y.npy => 2D heatmap
    - confusion_pred_norm.npy => confusion-like
-3) 输出图到 ./evaluation/figures/<csv_name>/...
+3) 输出图到 ./evaluation/figures/<csv_name>[/<run_id>]/...
 4) 已去掉 K-Fold 逻辑.
 """
 
 import os
+import re
 import yaml
 import numpy as np
 import pandas as pd
@@ -26,6 +27,9 @@ from utils import (
     ensure_dir,
     get_root_model_dir,
     get_model_dir,
+    get_postprocess_dir,
+    get_eval_dir,
+    get_run_id,
     # mic correlation
     plot_mic_network_heatmap,
     safe_filename,
@@ -65,19 +69,106 @@ def _find_group_idx(keyword, groups, colnames):
     return None
 
 
-def generate_shap_plots(csv_name, model_types, top_n):
+def _find_group_idx_by_name(keyword, group_names):
+    kw = keyword.lower()
+    for idx, name in enumerate(group_names):
+        if kw in str(name).lower():
+            return idx
+    return None
+
+
+def _find_latest_run_id(csv_name):
+    def _scan(base, marker=None):
+        if not os.path.isdir(base):
+            return []
+        candidates = []
+        for name in os.listdir(base):
+            path = os.path.join(base, name)
+            if not os.path.isdir(path):
+                continue
+            if not re.match(r"^\d{8}_\d{6}(?:_.*)?$", name):
+                continue
+            if marker and not os.path.exists(os.path.join(path, marker)):
+                continue
+            candidates.append(name)
+        return candidates
+
+    candidates = _scan(os.path.join("models", csv_name), "metadata.pkl")
+    if not candidates:
+        candidates = _scan(os.path.join("evaluation", "figures", csv_name))
+    return max(candidates) if candidates else None
+
+
+def _resolve_viz_run_id(csv_name, config=None):
+    rid = get_run_id(config)
+    if rid:
+        return rid
+    rid = _find_latest_run_id(csv_name)
+    if rid:
+        print(f"[INFO] RUN_ID not set; using latest run_id => {rid}")
+    return rid
+
+
+def _normalize_shap_values(shap_data):
+    """
+    Normalize SHAP values to list of 2D arrays: [(n_samples, n_features), ...].
+    Supports 2D array, 3D array, or list of 2D arrays.
+    """
+    sv = shap_data.get("shap_values", None)
+    if sv is None:
+        return shap_data
+    if isinstance(sv, list):
+        return shap_data
+    if not isinstance(sv, np.ndarray):
+        return shap_data
+    if sv.ndim == 2:
+        shap_data["shap_values"] = [sv]
+        return shap_data
+    if sv.ndim != 3:
+        return shap_data
+
+    n_samples = shap_data.get("X_full", None)
+    n_samples = n_samples.shape[0] if isinstance(n_samples, np.ndarray) else None
+    n_features = len(shap_data.get("x_col_names", []))
+    a, b, c = sv.shape
+
+    if c == n_features:
+        if n_samples is not None and a == n_samples:
+            shap_data["shap_values"] = [sv[:, i, :] for i in range(b)]
+            return shap_data
+        if n_samples is not None and b == n_samples:
+            shap_data["shap_values"] = [sv[i, :, :] for i in range(a)]
+            return shap_data
+
+    if b == n_features:
+        if n_samples is not None and a == n_samples:
+            shap_data["shap_values"] = [sv[:, :, i] for i in range(c)]
+            return shap_data
+        if n_samples is not None and c == n_samples:
+            shap_data["shap_values"] = [sv[i, :, :].T for i in range(a)]
+            return shap_data
+
+    # Fallback: assume outputs on axis=1
+    if n_samples is not None and a == n_samples:
+        shap_data["shap_values"] = [sv[:, i, :] for i in range(b)]
+    else:
+        shap_data["shap_values"] = [sv[i, :, :] for i in range(a)]
+    return shap_data
+
+
+def generate_shap_plots(csv_name, model_types, top_n, config=None):
     """
     从 shap_data.pkl 生成各种 SHAP 图；已插入 one-hot 合并逻辑
     """
+    run_id = _resolve_viz_run_id(csv_name, config)
     # ==== 载入 metadata，只做一次 ====
-    meta_path = os.path.join(get_root_model_dir(csv_name), "metadata.pkl")
+    meta_path = os.path.join(get_root_model_dir(csv_name, run_id=run_id), "metadata.pkl")
     meta_data = joblib.load(meta_path)
     onehot_groups = meta_data["onehot_groups"]
     orig_case_map = {c.lower(): c for c in meta_data["x_col_names"]}
 
     for mtype in model_types:
-        shap_dir = os.path.join("./evaluation/figures", csv_name, "model_comparison",
-                                mtype, "shap")
+        shap_dir = get_eval_dir(csv_name, run_id, "model_comparison", mtype, "shap")
         ensure_dir(shap_dir)
         local_dir = os.path.join(shap_dir, "local"); ensure_dir(local_dir)
         shap_data_path = os.path.join(shap_dir, "shap_data.pkl")
@@ -87,6 +178,7 @@ def generate_shap_plots(csv_name, model_types, top_n):
 
         # ----- 1) 读入 & 合并 one-hot -----
         raw_shap_data = joblib.load(shap_data_path)
+        raw_shap_data = _normalize_shap_values(raw_shap_data)
         shap_data = merge_onehot_shap(raw_shap_data,
                                       onehot_groups=onehot_groups,
                                       case_map=orig_case_map)   # 不想恢复大小写就传 None
@@ -152,7 +244,7 @@ def generate_shap_plots(csv_name, model_types, top_n):
 
 
 
-def load_optuna_trials_df(data_name, mtype):
+def load_optuna_trials_df(data_name, mtype, run_id=None):
     """
     根据数据名和模型类型，加载 study.pkl 并返回预处理后的 trials DataFrame；
     对所有以 "params_" 开头的列名去除前缀。
@@ -164,9 +256,13 @@ def load_optuna_trials_df(data_name, mtype):
     返回：
       如果 study 文件存在，返回预处理后的 DataFrame，否则返回 None。
     """
-    study_path = os.path.join("postprocessing", data_name, "optuna", mtype, "study.pkl")
+    study_path = get_postprocess_dir(data_name, run_id, "optuna", mtype, "study.pkl")
     if os.path.exists(study_path):
-        study_obj = joblib.load(study_path)
+        try:
+            study_obj = joblib.load(study_path)
+        except Exception as e:
+            print(f"[WARN] Failed to load optuna study for {mtype}: {e}")
+            return None
         trials_df = study_obj.trials_dataframe()
         trials_df.rename(
             columns=lambda x: x.replace("params_", "") if x.startswith("params_") else x,
@@ -181,20 +277,21 @@ def load_optuna_trials_df(data_name, mtype):
 def plot_optuna_results(config):
     """
     针对 config["optuna"]["models"] 中的每个模型，
-    从 postprocessing/<csv_name>/optuna/<model>/study.pkl 中加载调参 study 对象，
-    调用各工具函数生成调参图表，保存到 evaluation/figures/<csv_name>/optuna/<model>/ 下，
+    从 postprocessing/<csv_name>[/<run_id>]/optuna/<model>/study.pkl 中加载调参 study 对象，
+    调用各工具函数生成调参图表，保存到 evaluation/figures/<csv_name>[/<run_id>]/optuna/<model>/ 下，
     同时生成汇总图。
     """
     import os, joblib
     csv_name = os.path.splitext(os.path.basename(config["data"]["path"]))[0]
-    dest_optuna = os.path.join("evaluation", "figures", csv_name, "optuna")
+    run_id = _resolve_viz_run_id(csv_name, config)
+    dest_optuna = get_eval_dir(csv_name, run_id, "optuna")
     ensure_dir(dest_optuna)
 
     # 保存单个模型的绘图结果前，也建立一个字典来保存各模型的 trials_df
     trials_dict = {}
 
     for mtype in config["optuna"]["models"]:
-        trials_df = load_optuna_trials_df(csv_name, mtype)
+        trials_df = load_optuna_trials_df(csv_name, mtype, run_id=run_id)
         if trials_df is not None:
             trials_dict[mtype] = trials_df
             model_optuna_dir = os.path.join(dest_optuna, mtype)
@@ -214,30 +311,40 @@ def plot_optuna_results(config):
             out_importance = os.path.join(model_optuna_dir, "param_importances.jpg")
             plot_optuna_param_importances(trials_df, out_importance)
 
+    if not trials_dict:
+        print("[WARN] No optuna trials found => skip optuna plots.")
+        return
+
     # 生成汇总图：只负责绘图，将 trials 数据提前准备好传入
     out_summary = os.path.join(dest_optuna, "summary.jpg")
     plot_optuna_summary_curve(trials_dict, out_summary)
 
 
 def visualize_main():
-    with open("./configs/config.yaml", "r") as f:
+    config_path = os.path.join(os.path.dirname(__file__), "configs", "config.yaml")
+    with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
     csv_path = config["data"]["path"]
+    if not os.path.isabs(csv_path):
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(config_path), ".."))
+        csv_path = os.path.join(repo_root, csv_path)
+        config["data"]["path"] = csv_path
     csv_name = os.path.splitext(os.path.basename(csv_path))[0]
+    run_id = _resolve_viz_run_id(csv_name, config)
 
     # 如果配置中要求保存 optuna 相关图，则调用该函数
     if config["evaluation"].get("save_optuna", False):
         plot_optuna_results(config)
 
-    base_train = os.path.join("postprocessing", csv_name, "train")
+    base_train = get_postprocess_dir(csv_name, run_id, "train")
     if not os.path.isdir(base_train):
         print(f"[WARN] train folder not found => {base_train}")
         return
 
     # ========== 1.1) df_raw_14.csv & data_corr_dir ==========
     raw_csv_path = os.path.join(base_train, "df_raw_14.csv")
-    data_corr_dir = os.path.join("./evaluation/figures", csv_name, "DataCorrelation")
+    data_corr_dir = get_eval_dir(csv_name, run_id, "DataCorrelation")
     ensure_dir(data_corr_dir)
 
     if os.path.exists(raw_csv_path):
@@ -330,14 +437,14 @@ def visualize_main():
         val_losses = np.load(val_loss_path) if os.path.exists(val_loss_path) else None
 
         # 读取 y_col_names (若存在)
-        model_dir = get_model_dir(csv_name, mtype)
+        model_dir = get_model_dir(csv_name, mtype, run_id=run_id)
         ycol_path = os.path.join(model_dir, "y_col_names.npy")
         if os.path.exists(ycol_path):
             y_cols = list(np.load(ycol_path, allow_pickle=True))
         else:
             y_cols = None
 
-        model_comp_dir = os.path.join("./evaluation/figures", csv_name, "model_comparison", mtype)
+        model_comp_dir = get_eval_dir(csv_name, run_id, "model_comparison", mtype)
         ensure_dir(model_comp_dir)
 
         # (a) 绘制 Loss
@@ -392,7 +499,7 @@ def visualize_main():
             if (Y_train is not None) and (Y_val is not None):
                 y_cols = None
                 for mtype in model_types:
-                    model_dir = get_model_dir(csv_name, mtype)
+                    model_dir = get_model_dir(csv_name, mtype, run_id=run_id)
                     ycol_path = os.path.join(model_dir, "y_col_names.npy")
                     if os.path.exists(ycol_path):
                         y_cols = list(np.load(ycol_path, allow_pickle=True))
@@ -420,9 +527,9 @@ def visualize_main():
                     col_name = y_cols[d]
                     # out_tr_fig = os.path.join("./evaluation/figures", csv_name, "model_comparison",
                     #                            f"multi_residual_{col_name}_train.jpg")
-                    out_tr_fig = os.path.join(
-                        "./evaluation/figures",
+                    out_tr_fig = get_eval_dir(
                         csv_name,
+                        run_id,
                         "model_comparison",
                         f"multi_residual_{safe_filename(col_name)}_train.jpg"
                     )
@@ -435,9 +542,9 @@ def visualize_main():
                         rug_negative_space=0.13,
                         show_zero_line_arrow=False
                     )
-                    out_val_fig = os.path.join(
-                        "./evaluation/figures",
+                    out_val_fig = get_eval_dir(
                         csv_name,
+                        run_id,
                         "model_comparison",
                         f"multi_residual_{safe_filename(col_name)}_valid.jpg"
                     )
@@ -456,12 +563,12 @@ def visualize_main():
         # ========== 4) SHAP 可解释性图 ==========
         if config["evaluation"].get("save_shap", False):
             inp_len = int(config["data"]["input_len"])
-            generate_shap_plots(csv_name, model_types,top_n=inp_len)
+            generate_shap_plots(csv_name, model_types, top_n=inp_len, config=config)
 
     # ========== 5) 推理可视化 (Heatmap + Confusion) ==========
-    base_inf = os.path.join("postprocessing", csv_name, "inference")
+    base_inf = get_postprocess_dir(csv_name, run_id, "inference")
     inf_models = config["inference"].get("models", [])
-    metadata_path = os.path.join(get_root_model_dir(csv_name), "metadata.pkl")
+    metadata_path = os.path.join(get_root_model_dir(csv_name, run_id=run_id), "metadata.pkl")
     if os.path.exists(metadata_path):
         meta_data = joblib.load(metadata_path)
         stats_dict = meta_data.get("continuous_cols", {})
@@ -483,7 +590,7 @@ def visualize_main():
             print(f"[WARN] no inference dir => {inf_dir}")
             continue
         # >>>>>>> 这三行是修复重点  <<<<<<<<
-        base_out = os.path.join("./evaluation/figures", csv_name, "inference", mtype)
+        base_out = get_eval_dir(csv_name, run_id, "inference", mtype)
         ensure_dir(base_out)
         confusion_path = os.path.join(inf_dir, "confusion_pred_norm.npy")
         # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
@@ -532,7 +639,7 @@ def visualize_main():
 
             # ---------- 输出变量名 ----------
             y_cols = None
-            yp = os.path.join(get_model_dir(csv_name, mtype), "y_col_names.npy")
+            yp = os.path.join(get_model_dir(csv_name, mtype, run_id=run_id), "y_col_names.npy")
             if os.path.exists(yp):
                 y_cols = list(np.load(yp, allow_pickle=True))
 
@@ -568,7 +675,7 @@ def visualize_main():
 
             # 读取 y_col_names（如有）
             y_cols = None
-            yp = os.path.join(get_model_dir(csv_name, mtype), "y_col_names.npy")
+            yp = os.path.join(get_model_dir(csv_name, mtype, run_id=run_id), "y_col_names.npy")
             if os.path.exists(yp):
                 y_cols = list(np.load(yp, allow_pickle=True))
 
@@ -595,11 +702,13 @@ def visualize_main():
             confusion_pred = np.load(confusion_path)
 
             # ① metadata：拿到 one-hot 组 & x 列名
-            meta_path = os.path.join(get_root_model_dir(csv_name), "metadata.pkl")
+            meta_path = os.path.join(get_root_model_dir(csv_name, run_id=run_id), "metadata.pkl")
             meta = joblib.load(meta_path)
             oh_groups = meta["onehot_groups"]  # List[List[int]]
+            group_names = meta.get("group_names", [])
+            group_value_vectors = meta.get("group_value_vectors", {})
 
-            xcol_path = os.path.join(get_model_dir(csv_name, mtype), "x_col_names.npy")
+            xcol_path = os.path.join(get_model_dir(csv_name, mtype, run_id=run_id), "x_col_names.npy")
             xcols = list(np.load(xcol_path, allow_pickle=True))
 
             if len(oh_groups) >= 2:  # ←—— 这里保留 !
@@ -607,23 +716,41 @@ def visualize_main():
                 row_kw = config["inference"]["confusion_axes"]["row_name"]
                 col_kw = config["inference"]["confusion_axes"]["col_name"]
 
-                row_idx = _find_group_idx(row_kw, oh_groups, xcols)
-                col_idx = _find_group_idx(col_kw, oh_groups, xcols)
+                row_idx = _find_group_idx_by_name(row_kw, group_names) if group_names else None
+                col_idx = _find_group_idx_by_name(col_kw, group_names) if group_names else None
+
+                if (row_idx is None) or (col_idx is None):
+                    row_idx = _find_group_idx(row_kw, oh_groups, xcols)
+                    col_idx = _find_group_idx(col_kw, oh_groups, xcols)
 
                 if (row_idx is None) or (col_idx is None):
                     print("[WARN] 找不到关键字对应的 one-hot 组，退回前两组。")
                     grpA, grpB = oh_groups[:2]
+                    row_name = group_names[0] if group_names else None
+                    col_name = group_names[1] if group_names else None
                 elif row_idx == col_idx:
                     raise ValueError("row_name 与 col_name 落在同一个 one-hot 组，请检查 config.")
                 else:
                     grpA, grpB = oh_groups[row_idx], oh_groups[col_idx]
+                    row_name = group_names[row_idx] if row_idx < len(group_names) else None
+                    col_name = group_names[col_idx] if col_idx < len(group_names) else None
 
                 # ③ 生成行/列标签
-                row_labels = [xcols[cid] for cid in grpA]
-                col_labels = [xcols[cid] for cid in grpB]
+                row_labels_path = os.path.join(inf_dir, "confusion_row_labels.npy")
+                col_labels_path = os.path.join(inf_dir, "confusion_col_labels.npy")
+
+                if os.path.exists(row_labels_path) and os.path.exists(col_labels_path):
+                    row_labels = list(np.load(row_labels_path, allow_pickle=True))
+                    col_labels = list(np.load(col_labels_path, allow_pickle=True))
+                elif row_name in group_value_vectors and col_name in group_value_vectors:
+                    row_labels = group_value_vectors[row_name]["values"]
+                    col_labels = group_value_vectors[col_name]["values"]
+                else:
+                    row_labels = [xcols[cid] for cid in grpA]
+                    col_labels = [xcols[cid] for cid in grpB]
 
                 # ④ 读取输出标签（可选）
-                ycol_path = os.path.join(get_model_dir(csv_name, mtype), "y_col_names.npy")
+                ycol_path = os.path.join(get_model_dir(csv_name, mtype, run_id=run_id), "y_col_names.npy")
                 y_cols = list(np.load(ycol_path, allow_pickle=True)) if os.path.exists(ycol_path) else None
 
                 # ⑤ 开始绘图

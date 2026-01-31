@@ -12,7 +12,7 @@ class RFRegression:
     """
 
     def __init__(self, n_estimators=100, max_depth=10, random_state=42,
-                 ccp_alpha=0.0, min_samples_leaf=1):
+                 ccp_alpha=0.0, min_samples_leaf=1, n_jobs=-1):
         """
                :param n_estimators: number of trees in the forest
                :param max_depth: maximum depth of the trees
@@ -23,7 +23,8 @@ class RFRegression:
             max_depth=max_depth,
             random_state=random_state,
             ccp_alpha=ccp_alpha,
-            min_samples_leaf=min_samples_leaf
+            min_samples_leaf=min_samples_leaf,
+            n_jobs=n_jobs
         )
 
     def fit(self, X, Y):

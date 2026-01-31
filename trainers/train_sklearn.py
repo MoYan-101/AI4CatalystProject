@@ -8,16 +8,24 @@ def train_sklearn_model(model,
     """
 
     if enable_early_stop and X_val is not None:
+        base_name = model.__class__.__name__
+        if hasattr(model, "model"):
+            base_name = model.model.__class__.__name__
+
         fit_kwargs = dict(
             eval_set=[(X_val, Y_val)],
-            early_stopping_rounds=es_rounds,
             verbose=False
         )
-        # CatBoost 需要 use_best_model
-        if hasattr(model, "model") and model.model.__class__.__name__.startswith("CatBoost"):
-            fit_kwargs["use_best_model"] = True
 
-        # 对 XGBRegression 等，也能正常 set_params 中的 early_stopping_rounds
+        if base_name.startswith("CatBoost"):
+            fit_kwargs["use_best_model"] = True
+            fit_kwargs["early_stopping_rounds"] = es_rounds
+        elif base_name.startswith("XGB"):
+            # XGBoost 3.x 走 set_params(early_stopping_rounds)，fit 不接收该参数
+            pass
+        else:
+            fit_kwargs["early_stopping_rounds"] = es_rounds
+
         model.fit(X_train, Y_train, **fit_kwargs)
     else:
         model.fit(X_train, Y_train)
