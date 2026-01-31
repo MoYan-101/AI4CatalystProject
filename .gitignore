@@ -1,0 +1,20 @@
+.venv/
+.idea/
+.vscode/
+.pytest_cache/
+__pycache__/
+catboost_info/
+
+# Data artifacts
+data/*.csv
+data/*.zip
+data/*.jpg
+data/*.jpeg
+data/*.png
+data/*.log
+
+# Training outputs
+models/*/
+models/__pycache__/
+postprocessing/
+evaluation/figures/
