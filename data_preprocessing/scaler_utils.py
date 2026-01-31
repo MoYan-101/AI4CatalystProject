@@ -41,6 +41,7 @@ def standardize_data(X_train, X_val,
                      do_input=True,
                      do_output=False,
                      numeric_cols_idx=None,
+                     scale_cols_idx=None,
                      do_output_bounded=False,
                      bounded_output_cols_idx=None):
     """
@@ -53,6 +54,9 @@ def standardize_data(X_train, X_val,
     If bounded_output_cols_idx is provided (a list of column indices),
     then only those specified columns are processed with bounded_transform,
     and the remaining columns are processed normally.
+
+    scale_cols_idx controls which X columns are standardized. If None,
+    numeric_cols_idx is used; if that is also None, all columns are scaled.
     """
     scaler_x = None
     scaler_y = None
@@ -63,12 +67,14 @@ def standardize_data(X_train, X_val,
     Y_val_s   = np.copy(Y_val)
 
     if do_input:
-        if numeric_cols_idx is None:
-            numeric_cols_idx = list(range(X_train.shape[1]))
+        if scale_cols_idx is None:
+            if numeric_cols_idx is None:
+                numeric_cols_idx = list(range(X_train.shape[1]))
+            scale_cols_idx = numeric_cols_idx
         scaler_x = StandardScaler()
-        scaler_x.fit(X_train_s[:, numeric_cols_idx])
-        X_train_s[:, numeric_cols_idx] = scaler_x.transform(X_train_s[:, numeric_cols_idx])
-        X_val_s[:, numeric_cols_idx]   = scaler_x.transform(X_val_s[:, numeric_cols_idx])
+        scaler_x.fit(X_train_s[:, scale_cols_idx])
+        X_train_s[:, scale_cols_idx] = scaler_x.transform(X_train_s[:, scale_cols_idx])
+        X_val_s[:, scale_cols_idx]   = scaler_x.transform(X_val_s[:, scale_cols_idx])
 
     if do_output:
         # 根据 bounded_output_cols_idx 优先，仅对指定列应用 bounded_transform

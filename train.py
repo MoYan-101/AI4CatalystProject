@@ -3,10 +3,10 @@
 """
 train.py
 
-- 读取 CSV (前14列)
-- 得到 X, Y, numeric_cols_idx, x_col_names, y_col_names, observed_combos, onehot_groups, oh_index_map
+- 读取 CSV 并构建智能特征 (数值 + 元素/文本嵌入)
+- 得到 X, Y, numeric_cols_idx, x_col_names, y_col_names, observed_values, onehot_groups
 - 训练模型并保存
-- 将 observed_combos, onehot_groups, oh_index_map 等一起存进 metadata.pkl
+- 将特征统计、分组信息与观察值写入 metadata.pkl
 """
 
 import yaml
@@ -19,14 +19,16 @@ import shap
 from catboost import Pool
 import optuna
 import shutil  # 用于复制调参结果到 evaluation 目录
-from utils import get_model_dir, get_root_model_dir
+from utils import get_model_dir, get_root_model_dir, get_postprocess_dir, get_eval_dir, get_run_id
 import json                    # 需要写 ann_meta
 from data_preprocessing.my_dataset import MyDataset
 
-from data_preprocessing.data_loader import (
-    load_dataset,
+from data_preprocessing.data_loader_modified import (
+    load_smart_data_simple,
     load_raw_data_for_correlation,
-    extract_data_statistics
+    extract_data_statistics,
+    build_group_value_vectors,
+    save_duplicate_input_conflict_report
 )
 from data_preprocessing.data_split import split_data
 from data_preprocessing.scaler_utils import (
@@ -39,6 +41,7 @@ from models.model_rf import RFRegression
 from models.model_dt import DTRegression
 from models.model_catboost import CatBoostRegression
 from models.model_xgb import XGBRegression
+from models.model_svm import SVMRegression
 
 # 训练 & 评估
 from losses.torch_losses import get_torch_loss_fn
@@ -74,6 +77,13 @@ def _safe_int_range(cfg, lo_key, hi_key):
         high = low + 1
     return low, high
 
+def _suggest_float_auto(trial, name, low, high, log_threshold=50.0):
+    if low <= 0:
+        return trial.suggest_float(name, low, high)
+    if high / max(low, 1e-12) >= log_threshold:
+        return trial.suggest_float(name, low, high, log=True)
+    return trial.suggest_float(name, low, high)
+
 def _to_2d(arr: np.ndarray) -> np.ndarray:
     """把 (n,) 向量统一 reshape 成 (n,1)。已是 2-D 的直接返回。"""
     return arr.reshape(-1, 1) if arr.ndim == 1 else arr
@@ -86,6 +96,8 @@ def tune_model(model_type, config, X, Y,
                random_seed):
 
     # 1) split & standardize --------------------------------------------------
+    scale_all = config.get("preprocessing", {}).get("standardize_all_features", False)
+    scale_cols_idx = list(range(X.shape[1])) if scale_all else numeric_cols_idx
     X_train, X_val, Y_train, Y_val = split_data(
         X, Y, test_size=config["data"]["test_size"], random_state=random_seed
     )
@@ -93,7 +105,8 @@ def tune_model(model_type, config, X, Y,
         X_train, X_val, Y_train, Y_val,
         do_input = config["preprocessing"]["standardize_input"],
         do_output= config["preprocessing"]["standardize_output"],
-        numeric_cols_idx=numeric_cols_idx
+        numeric_cols_idx=numeric_cols_idx,
+        scale_cols_idx=scale_cols_idx
     )
 
     # 2) Optuna objective -----------------------------------------------------
@@ -226,6 +239,41 @@ def tune_model(model_type, config, X, Y,
                                                  enable_early_stop=True, es_rounds=es_rounds)
             pred_train, pred_val = model_instance.predict(X_train_s), model_instance.predict(X_val_s)
 
+        elif model_type == "SVM":
+            base = config["optuna"]["svm_params"]
+            c_lo, c_hi = _safe_float_range(base, "C_min", "C_max")
+            e_lo, e_hi = _safe_float_range(base, "epsilon_min", "epsilon_max")
+            g_lo, g_hi = _safe_float_range(base, "gamma_min", "gamma_max")
+            k_choices = base.get("kernel_choices", None)
+            if k_choices is None:
+                k_cfg = base.get("kernel", "rbf")
+                k_choices = list(k_cfg) if isinstance(k_cfg, (list, tuple)) else [k_cfg]
+            kernel = trial.suggest_categorical("kernel", k_choices)
+
+            if kernel in ["rbf", "poly", "sigmoid"]:
+                gamma = _suggest_float_auto(trial, "gamma", g_lo, g_hi)
+            else:
+                gamma = "scale"
+
+            degree = None
+            coef0 = None
+            if kernel == "poly":
+                d_lo, d_hi = _safe_int_range(base, "degree_min", "degree_max")
+                c0_lo, c0_hi = _safe_float_range(base, "coef0_min", "coef0_max")
+                degree = trial.suggest_int("degree", d_lo, d_hi)
+                coef0 = _suggest_float_auto(trial, "coef0", c0_lo, c0_hi)
+
+            model_instance = SVMRegression(
+                kernel=kernel,
+                C=_suggest_float_auto(trial, "C", c_lo, c_hi),
+                epsilon=_suggest_float_auto(trial, "epsilon", e_lo, e_hi),
+                gamma=gamma,
+                degree=degree if degree is not None else 3,
+                coef0=coef0 if coef0 is not None else 0.0
+            )
+            model_instance = train_sklearn_model(model_instance, X_train_s, Y_train_s)
+            pred_train, pred_val = model_instance.predict(X_train_s), model_instance.predict(X_val_s)
+
         else:
             raise ValueError(f"Tuning for {model_type} not implemented.")
 
@@ -258,7 +306,8 @@ def tune_model(model_type, config, X, Y,
     print(f"[{model_type}] Best Obj={study.best_value:.6f}, params={best_params}")
 
     csv_name = os.path.splitext(os.path.basename(config["data"]["path"]))[0]
-    optuna_dir = os.path.join("postprocessing", csv_name, "optuna", model_type)
+    run_id = get_run_id(config)
+    optuna_dir = get_postprocess_dir(csv_name, run_id, "optuna", model_type)
     ensure_dir(optuna_dir)
     # study.trials_dataframe().to_csv(os.path.join(optuna_dir, "trials.csv"), index=False)
 
@@ -267,8 +316,9 @@ def tune_model(model_type, config, X, Y,
 
 def create_model_by_type(model_type, config, random_seed=42, input_dim=None):
     csv_name = os.path.splitext(os.path.basename(config["data"]["path"]))[0]
+    run_id = get_run_id(config)
     best_params = None
-    optuna_dir = os.path.join("postprocessing", csv_name, "optuna", model_type)
+    optuna_dir = get_postprocess_dir(csv_name, run_id, "optuna", model_type)
     best_params_path = os.path.join(optuna_dir, "best_params.pkl")
     if os.path.exists(best_params_path):
         best_params = joblib.load(best_params_path)
@@ -281,11 +331,20 @@ def create_model_by_type(model_type, config, random_seed=42, input_dim=None):
     if model_type == "ANN":
         # 从 config 中取出 ann_params，并用 optuna 的 best_params 更新
         ann_cfg = config["model"].get("ann_params", {}).copy()
-        ckpt_path = os.path.join(get_model_dir(csv_name, "ANN"), "best_ann.pt")
+        ckpt_path = os.path.join(get_model_dir(csv_name, "ANN", run_id=run_id), "best_ann.pt")
         ensure_dir(os.path.dirname(ckpt_path))  # <<< 新增，确保目录存在
         ann_cfg.setdefault("checkpoint_path",ckpt_path)
         if best_params:
             ann_cfg.update(best_params)
+        # baseline defaults when optuna is disabled
+        ann_cfg.setdefault("hidden_dims", (64, 64))
+        ann_cfg.setdefault("dropout", 0.0)
+        ann_cfg.setdefault("learning_rate", 1e-3)
+        ann_cfg.setdefault("weight_decay", 0.0)
+        ann_cfg.setdefault("batch_size", 128)
+        ann_cfg.setdefault("optimizer", "AdamW")
+        ann_cfg.setdefault("activation", "ReLU")
+        ann_cfg.setdefault("random_seed", random_seed)
         # --- 新增两行 ---------------------------------------------------
         out_dim = config["data"]["output_len"]  # 读 yaml 里真正的输出列数
         ann_cfg["output_dim"] = out_dim  # 保存在字典里，后面训练要用
@@ -303,47 +362,90 @@ def create_model_by_type(model_type, config, random_seed=42, input_dim=None):
         # 返回模型和更新后的超参数字典
         return model, ann_cfg
     elif model_type == "RF":
-        rf_cfg = config["model"]["rf_params"].copy()
+        rf_cfg = config["model"].get("rf_params", {}).copy()
         if best_params:
             rf_cfg.update(best_params)
+        rf_cfg.setdefault("n_estimators", 200)
+        rf_cfg.setdefault("max_depth", 12)
+        rf_cfg.setdefault("random_state", random_seed)
+        rf_cfg.setdefault("ccp_alpha", 0.0)
+        rf_cfg.setdefault("min_samples_leaf", 1)
+        rf_cfg.setdefault("n_jobs", -1)
         return RFRegression(
             n_estimators=rf_cfg["n_estimators"],
             max_depth=rf_cfg["max_depth"],
             random_state=rf_cfg["random_state"],
             ccp_alpha=rf_cfg.get("ccp_alpha", 0.0),
-            min_samples_leaf=rf_cfg.get("min_samples_leaf", 1)
+            min_samples_leaf=rf_cfg.get("min_samples_leaf", 1),
+            n_jobs=rf_cfg.get("n_jobs", -1)
         )
     elif model_type == "DT":
-        dt_cfg = config["model"]["dt_params"].copy()
+        dt_cfg = config["model"].get("dt_params", {}).copy()
         if best_params:
             dt_cfg.update(best_params)
+        dt_cfg.setdefault("max_depth", 12)
+        dt_cfg.setdefault("random_state", random_seed)
+        dt_cfg.setdefault("ccp_alpha", 0.0)
         return DTRegression(
             max_depth=dt_cfg["max_depth"],
             random_state=dt_cfg["random_state"],
             ccp_alpha=dt_cfg.get("ccp_alpha", 0.0)
         )
     elif model_type == "CatBoost":
-        cat_cfg = config["model"]["catboost_params"].copy()
+        cat_cfg = config["model"].get("catboost_params", {}).copy()
         if best_params:
             cat_cfg.update(best_params)
+        cat_cfg.setdefault("iterations", 500)
+        cat_cfg.setdefault("learning_rate", 0.1)
+        cat_cfg.setdefault("depth", 8)
+        cat_cfg.setdefault("random_seed", random_seed)
+        cat_cfg.setdefault("l2_leaf_reg", 3.0)
+        cat_cfg.setdefault("thread_count", -1)
         return CatBoostRegression(
             iterations=cat_cfg["iterations"],
             learning_rate=cat_cfg["learning_rate"],
             depth=cat_cfg["depth"],
             random_seed=cat_cfg["random_seed"],
-            l2_leaf_reg=cat_cfg.get("l2_leaf_reg", 3.0)
+            l2_leaf_reg=cat_cfg.get("l2_leaf_reg", 3.0),
+            thread_count=cat_cfg.get("thread_count", -1)
         )
     elif model_type == "XGB":
-        xgb_cfg = config["model"]["xgb_params"].copy()
+        xgb_cfg = config["model"].get("xgb_params", {}).copy()
         if best_params:
             xgb_cfg.update(best_params)
+        xgb_cfg.setdefault("n_estimators", 300)
+        xgb_cfg.setdefault("learning_rate", 0.1)
+        xgb_cfg.setdefault("max_depth", 6)
+        xgb_cfg.setdefault("random_seed", random_seed)
+        xgb_cfg.setdefault("reg_alpha", 0.0)
+        xgb_cfg.setdefault("reg_lambda", 1.0)
+        xgb_cfg.setdefault("n_jobs", -1)
         return XGBRegression(
             n_estimators=xgb_cfg["n_estimators"],
             learning_rate=xgb_cfg["learning_rate"],
             max_depth=xgb_cfg["max_depth"],
             random_state=xgb_cfg["random_seed"],
             reg_alpha=xgb_cfg.get("reg_alpha", 0.0),
-            reg_lambda=xgb_cfg.get("reg_lambda", 1.0)
+            reg_lambda=xgb_cfg.get("reg_lambda", 1.0),
+            n_jobs=xgb_cfg.get("n_jobs", -1)
+        )
+    elif model_type == "SVM":
+        svm_cfg = config["model"].get("svm_params", {}).copy()
+        if best_params:
+            svm_cfg.update(best_params)
+        svm_cfg.setdefault("kernel", "rbf")
+        svm_cfg.setdefault("C", 10.0)
+        svm_cfg.setdefault("epsilon", 0.1)
+        svm_cfg.setdefault("gamma", "scale")
+        svm_cfg.setdefault("degree", 3)
+        svm_cfg.setdefault("coef0", 0.0)
+        return SVMRegression(
+            kernel=svm_cfg["kernel"],
+            C=svm_cfg["C"],
+            epsilon=svm_cfg["epsilon"],
+            gamma=svm_cfg["gamma"],
+            degree=svm_cfg["degree"],
+            coef0=svm_cfg["coef0"]
         )
     else:
         raise ValueError(f"Unknown model type: {model_type}")
@@ -352,30 +454,115 @@ def create_model_by_type(model_type, config, random_seed=42, input_dim=None):
 
 
 def train_main():
-    with open("./configs/config.yaml", "r") as f:
+    config_path = os.path.join(os.path.dirname(__file__), "configs", "config.yaml")
+    with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
+    env_alpha = os.environ.get("OVERFIT_ALPHA")
+    if env_alpha not in (None, ""):
+        try:
+            config.setdefault("optuna", {})["overfit_penalty_alpha"] = float(env_alpha)
+            print(f"[INFO] OVERFIT_ALPHA override => {config['optuna']['overfit_penalty_alpha']}")
+        except ValueError:
+            print(f"[WARN] Invalid OVERFIT_ALPHA='{env_alpha}', using config value.")
 
     csv_path = config["data"]["path"]
+    if not os.path.isabs(csv_path):
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(config_path), ".."))
+        csv_path = os.path.join(repo_root, csv_path)
+        config["data"]["path"] = csv_path
     csv_name = os.path.splitext(os.path.basename(csv_path))[0]
+    run_id = get_run_id(config)
     # 👇 这一行是新增
-    root_model_dir = get_root_model_dir(csv_name)
+    root_model_dir = get_root_model_dir(csv_name, run_id=run_id)
     ensure_dir(root_model_dir)
 
-    base_outdir = os.path.join("postprocessing", csv_name, "train")
+    base_outdir = get_postprocess_dir(csv_name, run_id, "train")
     ensure_dir(base_outdir)
 
-    # 1) 加载数据
-    in_len = config["data"]["input_len"]
-    out_len = config["data"]["output_len"]
-    (X, Y, numeric_cols_idx, x_col_names, y_col_names,
-     observed_combos, onehot_groups, oh_index_map) = load_dataset(csv_path, in_len, out_len)
+    # 1) 加载数据（智能特征器）
+    dl_cfg = config.get("data_loader", {})
+    element_cols = tuple(dl_cfg.get("element_cols", ["Promoter 1", "Promoter 2"]))
+    text_cols = tuple(dl_cfg.get("text_cols", ["Type of sysnthesis procedure"]))
+    y_cols = dl_cfg.get("y_cols", None)
+    element_embedding = dl_cfg.get("element_embedding", "advanced")
+    text_model_name = dl_cfg.get("text_model_name", "sentence-transformers/all-MiniLM-L6-v2")
+    text_normalize = dl_cfg.get("text_normalize", False)
+    drop_metadata_cols = tuple(dl_cfg.get("drop_metadata_cols", ["DOI", "Name", "Year"]))
+    fill_numeric = dl_cfg.get("fill_numeric", "median")
+    missing_text_token = dl_cfg.get("missing_text_token", "__MISSING__")
+    impute_missing = dl_cfg.get("impute_missing", True)
+    impute_method = dl_cfg.get("impute_method", "simple")
+    impute_seed = dl_cfg.get("impute_seed", 42)
+    preserve_null = dl_cfg.get("preserve_null", True)
+    impute_type_substring = dl_cfg.get("impute_type_substring", "Type")
+    impute_skip_substring = dl_cfg.get("impute_skip_substring", "ame")
+    save_conflict_report = dl_cfg.get("save_conflict_report", False)
+    conflict_report_prefix = dl_cfg.get("conflict_report_prefix", "duplicate_input")
+    conflict_report_dir = dl_cfg.get("conflict_report_dir", None)
 
-    # 1.1) 保存 X_onehot.npy
-    np.save(os.path.join(base_outdir, "X_onehot.npy"), X)
-    np.save(os.path.join(base_outdir, "x_onehot_colnames.npy"), x_col_names)
+    # Optional: report repeated inputs with conflicting outputs (diagnostic only).
+    if save_conflict_report:
+        conflict_path, aggregated_path, g_cnt, r_cnt = save_duplicate_input_conflict_report(
+            csv_path=csv_path,
+            y_cols=y_cols,
+            drop_metadata_cols=drop_metadata_cols,
+            output_dir=conflict_report_dir,
+            output_prefix=conflict_report_prefix,
+            preserve_null=preserve_null
+        )
+        if conflict_path and aggregated_path:
+            print(f"[INFO] Conflict report saved ({g_cnt} groups / {r_cnt} rows): {conflict_path}")
+            print(f"[INFO] Conflict aggregation saved: {aggregated_path}")
+
+    (X, Y, numeric_cols_idx, x_col_names, y_col_names,
+     observed_values, observed_value_counts, observed_value_ratios,
+     onehot_groups, feature_group_map) = load_smart_data_simple(
+        csv_path=csv_path,
+        element_cols=element_cols,
+        text_cols=text_cols,
+        y_cols=y_cols,
+        promoter_ratio_cols=dl_cfg.get("promoter_ratio_cols", None),
+        promoter_onehot=dl_cfg.get("promoter_onehot", True),
+        element_embedding=element_embedding,
+        text_model_name=text_model_name,
+        text_normalize=text_normalize,
+        drop_metadata_cols=drop_metadata_cols,
+        fill_numeric=fill_numeric,
+        missing_text_token=missing_text_token,
+        impute_missing=impute_missing,
+        impute_method=impute_method,
+        impute_seed=impute_seed,
+        preserve_null=preserve_null,
+        impute_type_substring=impute_type_substring,
+        impute_skip_substring=impute_skip_substring
+    )
+
+    scale_all_features = config.get("preprocessing", {}).get("standardize_all_features", False)
+    scale_cols_idx = list(range(X.shape[1])) if scale_all_features else numeric_cols_idx
+
+    # 1.1) 保存特征矩阵与列名
+    np.save(os.path.join(base_outdir, "X_features.npy"), X)
+    np.save(os.path.join(base_outdir, "x_feature_colnames.npy"), x_col_names)
 
     # 1.2) 若要做 raw correlation
-    df_raw_14 = load_raw_data_for_correlation(csv_path, drop_nan=True, input_len=in_len, output_len=out_len, fill_same_as_train=True)
+    in_len = config["data"].get("input_len", None)
+    out_len = config["data"].get("output_len", None)
+    df_raw_14 = load_raw_data_for_correlation(
+        csv_path,
+        drop_nan=True,
+        input_len=in_len,
+        output_len=out_len,
+        fill_same_as_train=True,
+        element_cols=element_cols,
+        text_cols=text_cols,
+        drop_metadata_cols=drop_metadata_cols,
+        impute_seed=impute_seed,
+        impute_type_substring=impute_type_substring,
+        impute_skip_substring=impute_skip_substring,
+        missing_text_token=missing_text_token,
+        impute_method=impute_method,
+        preserve_null=preserve_null
+    )
     raw_csv_path = os.path.join(base_outdir, "df_raw_14.csv")
     df_raw_14.to_csv(raw_csv_path, index=False)
     print(f"[INFO] Saved raw 14-col CSV => {raw_csv_path}")
@@ -383,11 +570,47 @@ def train_main():
     # 2) 提取统计信息 => metadata.pkl
     stats_dict = extract_data_statistics(X, x_col_names, numeric_cols_idx, Y=Y, y_col_names=y_col_names)
     stats_dict["numeric_cols_idx"] = numeric_cols_idx  # ← 这行新增
+    stats_dict["scale_cols_idx"] = scale_cols_idx
     stats_dict["onehot_groups"] = onehot_groups
-    stats_dict["oh_index_map"]  = oh_index_map
-    stats_dict["observed_onehot_combos"] = observed_combos
+    stats_dict["oh_index_map"] = feature_group_map
+    stats_dict["observed_onehot_combos"] = observed_values
+    stats_dict["observed_values"] = observed_values
+    stats_dict["observed_value_counts"] = observed_value_counts
+    stats_dict["observed_value_ratios"] = observed_value_ratios
+    stats_dict["group_names"] = list(element_cols) + list(text_cols)
+    stats_dict["group_value_vectors"] = build_group_value_vectors(
+        observed_values=observed_values,
+        observed_value_counts=observed_value_counts,
+        observed_value_ratios=observed_value_ratios,
+        element_cols=element_cols,
+        text_cols=text_cols,
+        element_embedding=element_embedding,
+        text_model_name=text_model_name,
+        text_normalize=text_normalize,
+        promoter_onehot=dl_cfg.get("promoter_onehot", True)
+    )
+    stats_dict["feature_means"] = X.mean(axis=0)
     stats_dict["x_col_names"] = x_col_names
     stats_dict["y_col_names"] = y_col_names
+    stats_dict["loader_config"] = {
+        "element_cols": list(element_cols),
+        "text_cols": list(text_cols),
+        "y_cols": list(y_cols) if y_cols is not None else None,
+        "promoter_ratio_cols": dl_cfg.get("promoter_ratio_cols", None),
+        "promoter_onehot": dl_cfg.get("promoter_onehot", True),
+        "element_embedding": element_embedding,
+        "text_model_name": text_model_name,
+        "text_normalize": text_normalize,
+        "drop_metadata_cols": list(drop_metadata_cols),
+        "fill_numeric": fill_numeric,
+        "missing_text_token": missing_text_token,
+        "impute_missing": impute_missing,
+        "impute_method": impute_method,
+        "impute_seed": impute_seed,
+        "preserve_null": preserve_null,
+        "impute_type_substring": impute_type_substring,
+        "impute_skip_substring": impute_skip_substring
+    }
 
     meta_path = os.path.join(root_model_dir, "metadata.pkl")
     joblib.dump(stats_dict, meta_path)
@@ -412,6 +635,7 @@ def train_main():
         do_input=config["preprocessing"]["standardize_input"],
         do_output=config["preprocessing"]["standardize_output"],
         numeric_cols_idx=numeric_cols_idx,
+        scale_cols_idx=scale_cols_idx,
         do_output_bounded=(bounded_indices is not None) or config["preprocessing"].get("bounded_output", False),
         bounded_output_cols_idx=bounded_indices
     )
@@ -424,7 +648,7 @@ def train_main():
         for mtype in config["optuna"]["models"]:
             print(f"\n[INFO] Tuning hyperparameters for {mtype} ...")
             study, best_params = tune_model(mtype, config, X, Y, numeric_cols_idx, x_col_names, y_col_names, random_seed)
-            optuna_dir = os.path.join("postprocessing", csv_name, "optuna", mtype)
+            optuna_dir = get_postprocess_dir(csv_name, run_id, "optuna", mtype)
             ensure_dir(optuna_dir)
             joblib.dump(study, os.path.join(optuna_dir, "study.pkl"))
             joblib.dump(best_params, os.path.join(optuna_dir, "best_params.pkl"))
@@ -456,6 +680,7 @@ def train_main():
                     do_input=config["preprocessing"]["standardize_input"],
                     do_output=config["preprocessing"]["standardize_output"],
                     numeric_cols_idx=numeric_cols_idx,
+                    scale_cols_idx=scale_cols_idx,
                     do_output_bounded=(bounded_indices is not None) or
                                       config["preprocessing"].get("bounded_output", False),
                     bounded_output_cols_idx=bounded_indices
@@ -679,7 +904,7 @@ def train_main():
         # ===========  (A) 结束  ===========
 
         ### <<< PATCH: save to per‑data model_dir ###
-        model_dir = get_model_dir(csv_name, mtype)
+        model_dir = get_model_dir(csv_name, mtype, run_id=run_id)
         ensure_dir(model_dir)
 
         if mtype == "ANN":
@@ -706,7 +931,7 @@ def train_main():
 
         #shap
         if config["evaluation"].get("save_shap", False):
-            shap_dir = os.path.join("evaluation/figures", csv_name, "model_comparison", mtype, "shap")
+            shap_dir = get_eval_dir(csv_name, run_id, "model_comparison", mtype, "shap")
             ensure_dir(shap_dir)
             X_full = np.concatenate([X_train, X_val], axis=0)
             X_full_s = np.concatenate([X_train_s, X_val_s], axis=0)
@@ -718,10 +943,39 @@ def train_main():
                     shap_values = explainer.shap_values(torch.tensor(X_full_s, dtype=torch.float32))
                 elif mtype == "CatBoost":
                     shap_values = model.get_shap_values(X_full_s)
-                else:
+                elif mtype in ["RF", "DT", "XGB"]:
                     base_model = model.model if hasattr(model, "model") else model
-                    explainer = shap.TreeExplainer(base_model)
-                    shap_values = explainer.shap_values(X_full_s)
+                    try:
+                        explainer = shap.TreeExplainer(base_model)
+                        shap_values = explainer.shap_values(X_full_s)
+                    except Exception:
+                        shap_values = None
+                        if mtype == "XGB" and hasattr(base_model, "get_booster"):
+                            try:
+                                explainer = shap.TreeExplainer(base_model.get_booster())
+                                shap_values = explainer.shap_values(X_full_s)
+                            except Exception:
+                                shap_values = None
+                        if shap_values is None:
+                            bg = shap.sample(X_train_s, 50, random_state=random_seed)
+                            X_explain = shap.sample(X_full_s, 200, random_state=random_seed)
+                            explainer = shap.KernelExplainer(base_model.predict, bg)
+                            shap_values = explainer.shap_values(X_explain, nsamples=100)
+                            X_full = X_explain
+                            X_full_s = X_explain
+                elif mtype == "SVM":
+                    bg = shap.sample(X_train_s, 50, random_state=random_seed)
+                    X_explain = shap.sample(X_full_s, 200, random_state=random_seed)
+                    base_model = model.model if hasattr(model, "model") else model
+                    explainer = shap.KernelExplainer(base_model.predict, bg)
+                    shap_values = explainer.shap_values(X_explain, nsamples=100)
+                    X_full = X_explain
+                    X_full_s = X_explain
+                else:
+                    print(f"[WARN] SHAP not supported for {mtype} => skip.")
+                    shap_values = None
+                if shap_values is None:
+                    raise RuntimeError("SHAP values not available.")
                 shap_save = {
                     "shap_values": shap_values,
                     "X_full": X_full_s,
@@ -761,7 +1015,7 @@ def train_main():
         df.columns = flat_cols
 
         # === 3) 写 Excel ========================================================
-        dest_dir = os.path.join("evaluation", "figures", csv_name)
+        dest_dir = get_eval_dir(csv_name, run_id)
         ensure_dir(dest_dir)
         excel_path = os.path.join(dest_dir, "metrics_summary.xlsx")
 

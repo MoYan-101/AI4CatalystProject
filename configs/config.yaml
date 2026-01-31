@@ -2,23 +2,38 @@
 # ---------------------------------------------------------
 # 数据相关
 data:
-  path: "./data/Test_0611_cleansed.csv"   # CSV 文件路径
+  path: "./data/Main_20260128_cleansed.csv"        # Read the data
   input_len: 13      # ← 你想改就改
   output_len: 4
   test_size: 0.3
   random_seed: 98 #123, 42, 36
 
+# 数据加载器配置
+data_loader:
+  impute_method: "kde"
+  preserve_null: true
+  # 仅生成诊断报告，不影响训练数据
+  save_conflict_report: false
+  conflict_report_prefix: "duplicate_input"
+  # conflict_report_dir: "./data"
+  promoter_ratio_cols:
+    - "Promoter 1 ratio (Promoter 1:Cu)"
+    - "Promoter 2 ratio (Promoter 2:Cu)"
+  element_embedding: "advanced"
+  promoter_onehot: true
+
 # 预处理配置
 preprocessing:
   standardize_input: true
   standardize_output: true
+  standardize_all_features: true
   bounded_output: false
   bounded_output_columns: ["Methanol selectivity (%)", "CO2 conversion efficiency (%)", "CO selectivity (%)"]
 
 # 模型相关
 # 训练多个模型时，这里仅保留 checkpoint_path，所有其他超参数均来源于 optuna
 model:
-  types: ["RF", "CatBoost", "DT", "ANN", "XGB"]
+  types: ["RF", "CatBoost", "DT", "ANN", "XGB", "SVM"]
   # 对于深度学习模型（ANN），仅保留 checkpoint_path 用于后续加载
   ann_params:
     epochs: 6000
@@ -27,12 +42,20 @@ model:
     random_state: 42
   rf_params:
     random_state: 42
+    n_jobs: -1
   catboost_params:
     random_seed: 42
     early_stopping_rounds: 50
+    thread_count: -1
   xgb_params:
     random_seed: 42
     early_stopping_rounds: 50
+    n_jobs: -1
+  svm_params:
+    kernel: "rbf"
+    C: 10.0
+    epsilon: 0.1
+    gamma: "scale"
 
 # 损失函数配置（主要用于深度学习模型）
 loss:
@@ -56,9 +79,11 @@ evaluation:
 
 # 推断相关（不作修改）
 inference:
-  models: ["ANN", "CatBoost", "XGB"]
+  models: ["CatBoost", "SVM"]
   max_combinations: 200
   n_points: 50                 # ← 原来就有的话保留
+  enable_3d_heatmap: true      # ← 3DHeatmap-X 总开关
+  #skip_3d_models: ["SVM"]      # ← 可选：指定模型跳过 3D
   heatmap_axes: # ← 统一写这里，长度决定维度
     - "Temperature (°C)"
     - "GHSV (mL/g.h) (LN scale)"
@@ -70,15 +95,16 @@ inference:
 # Optuna 调参配置
 optuna:
   overfit_penalty_alpha: 0.0
-  enable: false
+  enable: true
   trials: 800
-  models: ["RF", "CatBoost", "DT", "ANN", "XGB"]
+  models: ["RF", "CatBoost", "DT", "ANN", "XGB", "SVM"]
   slice_params:
     ANN: ["hidden_dims", "learning_rate", "dropout", "weight_decay", "batch_size"]
     RF: ["n_estimators", "max_depth", "ccp_alpha"]
     DT: ["max_depth", "ccp_alpha"]
     CatBoost: ["iterations", "learning_rate", "depth", "l2_leaf_reg"]
     XGB: ["n_estimators", "learning_rate", "max_depth", "reg_alpha", "reg_lambda"]
+    SVM: ["C", "epsilon", "gamma"]
   ann_params:
     hidden_dims_choices:
       - [8, 8]
@@ -135,3 +161,11 @@ optuna:
     reg_alpha_max: 1e-4
     reg_lambda_min: 1.0
     reg_lambda_max: 3.0
+  svm_params:
+    kernel: "rbf"
+    C_min: 0.1
+    C_max: 100.0
+    epsilon_min: 0.001
+    epsilon_max: 0.5
+    gamma_min: 1e-4
+    gamma_max: 1e-1
