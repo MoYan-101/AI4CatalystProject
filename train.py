@@ -21,6 +21,7 @@ import optuna
 import shutil  # 用于复制调参结果到 evaluation 目录
 from utils import get_model_dir, get_root_model_dir, get_postprocess_dir, get_eval_dir, get_run_id
 import json                    # 需要写 ann_meta
+from typing import cast
 from data_preprocessing.my_dataset import MyDataset
 
 from data_preprocessing.data_loader_modified import (
@@ -485,8 +486,6 @@ def train_main():
     text_cols = tuple(dl_cfg.get("text_cols", ["Type of sysnthesis procedure"]))
     y_cols = dl_cfg.get("y_cols", None)
     element_embedding = dl_cfg.get("element_embedding", "advanced")
-    text_model_name = dl_cfg.get("text_model_name", "sentence-transformers/all-MiniLM-L6-v2")
-    text_normalize = dl_cfg.get("text_normalize", False)
     drop_metadata_cols = tuple(dl_cfg.get("drop_metadata_cols", ["DOI", "Name", "Year"]))
     fill_numeric = dl_cfg.get("fill_numeric", "median")
     missing_text_token = dl_cfg.get("missing_text_token", "__MISSING__")
@@ -496,6 +495,8 @@ def train_main():
     preserve_null = dl_cfg.get("preserve_null", True)
     impute_type_substring = dl_cfg.get("impute_type_substring", "Type")
     impute_skip_substring = dl_cfg.get("impute_skip_substring", "ame")
+    log_transform_cols = dl_cfg.get("log_transform_cols", None)
+    log_transform_eps = dl_cfg.get("log_transform_eps", 1e-8)
     save_conflict_report = dl_cfg.get("save_conflict_report", False)
     conflict_report_prefix = dl_cfg.get("conflict_report_prefix", "duplicate_input")
     conflict_report_dir = dl_cfg.get("conflict_report_dir", None)
@@ -516,16 +517,16 @@ def train_main():
 
     (X, Y, numeric_cols_idx, x_col_names, y_col_names,
      observed_values, observed_value_counts, observed_value_ratios,
-     onehot_groups, feature_group_map) = load_smart_data_simple(
+     onehot_groups, feature_group_map) = cast(tuple, load_smart_data_simple(
         csv_path=csv_path,
         element_cols=element_cols,
         text_cols=text_cols,
         y_cols=y_cols,
         promoter_ratio_cols=dl_cfg.get("promoter_ratio_cols", None),
         promoter_onehot=dl_cfg.get("promoter_onehot", True),
+        log_transform_cols=log_transform_cols,
+        log_transform_eps=log_transform_eps,
         element_embedding=element_embedding,
-        text_model_name=text_model_name,
-        text_normalize=text_normalize,
         drop_metadata_cols=drop_metadata_cols,
         fill_numeric=fill_numeric,
         missing_text_token=missing_text_token,
@@ -534,8 +535,9 @@ def train_main():
         impute_seed=impute_seed,
         preserve_null=preserve_null,
         impute_type_substring=impute_type_substring,
-        impute_skip_substring=impute_skip_substring
-    )
+        impute_skip_substring=impute_skip_substring,
+        return_dataframe=False
+    ))
 
     scale_all_features = config.get("preprocessing", {}).get("standardize_all_features", False)
     scale_cols_idx = list(range(X.shape[1])) if scale_all_features else numeric_cols_idx
@@ -585,8 +587,6 @@ def train_main():
         element_cols=element_cols,
         text_cols=text_cols,
         element_embedding=element_embedding,
-        text_model_name=text_model_name,
-        text_normalize=text_normalize,
         promoter_onehot=dl_cfg.get("promoter_onehot", True)
     )
     stats_dict["feature_means"] = X.mean(axis=0)
@@ -598,9 +598,9 @@ def train_main():
         "y_cols": list(y_cols) if y_cols is not None else None,
         "promoter_ratio_cols": dl_cfg.get("promoter_ratio_cols", None),
         "promoter_onehot": dl_cfg.get("promoter_onehot", True),
+        "log_transform_cols": log_transform_cols,
+        "log_transform_eps": log_transform_eps,
         "element_embedding": element_embedding,
-        "text_model_name": text_model_name,
-        "text_normalize": text_normalize,
         "drop_metadata_cols": list(drop_metadata_cols),
         "fill_numeric": fill_numeric,
         "missing_text_token": missing_text_token,
@@ -688,8 +688,9 @@ def train_main():
 
                 # -------------------------------- build & train model_cv
                 if mtype == "ANN":
-                    model_cv, ann_cfg = create_model_by_type(
-                        "ANN", config, random_seed, input_dim=X_tr_s.shape[1]
+                    model_cv, ann_cfg = cast(
+                        tuple[ANNRegression, dict],
+                        create_model_by_type("ANN", config, random_seed, input_dim=X_tr_s.shape[1])
                     )
                     if "epochs" not in ann_cfg:
                         ann_cfg["epochs"] = config["model"].get("ann_params", {}).get("epochs", 6000)
@@ -777,14 +778,18 @@ def train_main():
 
     # 6) 正式训练 & 保存模型
     model_types = config["model"]["types"]
-    metrics_rows = []  # ← Excel 行缓冲区
+    metrics_rows: list[dict[tuple[str, str, str] | str, float | str]] = []  # ← Excel 行缓冲区
     for mtype in model_types:
+        val_losses: list[float] | None = None
         print(f"\n=== Train model: {mtype} ===")
         outdir_m = os.path.join(base_outdir, mtype)
         ensure_dir(outdir_m)
         # 针对ANN，解包返回的超参数字典
         if mtype == "ANN":
-            model, ann_cfg = create_model_by_type(mtype, config, random_seed, input_dim=X_train_s.shape[1])
+            model, ann_cfg = cast(
+                tuple[ANNRegression, dict],
+                create_model_by_type("ANN", config, random_seed, input_dim=X_train_s.shape[1])
+            )
             if "epochs" not in ann_cfg:
                 ann_cfg["epochs"] = config["model"].get("ann_params",{}).get("epochs", 6000)
             loss_fn = get_torch_loss_fn(config["loss"]["type"])
@@ -878,7 +883,7 @@ def train_main():
 
         # ===========  (A) 组装一行  ===========
         out_names = y_col_names or [f"output{i}" for i in range(train_pred_raw.shape[1])]
-        row_dict = {"model": mtype}
+        row_dict: dict[tuple[str, str, str] | str, float | str] = {"model": mtype}
 
         for d, name in enumerate(out_names):
             # 1) R² —— RAW 域
@@ -908,6 +913,7 @@ def train_main():
         ensure_dir(model_dir)
 
         if mtype == "ANN":
+            assert val_losses is not None
             torch.save(model.state_dict(),
                        os.path.join(model_dir, "best_ann.pt"))
             ann_meta = {

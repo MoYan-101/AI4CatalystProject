@@ -21,32 +21,32 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.cm as cm
 from matplotlib.collections import PolyCollection
+from matplotlib.artist import Artist
+from matplotlib.projections.polar import PolarAxes
 import pandas as pd
 import math
-import scipy.stats as ss
 from matplotlib.patches import Patch, Polygon, Rectangle
 from sklearn.metrics import r2_score
-from scipy.stats import pearsonr, spearmanr, pointbiserialr
-from matplotlib.ticker import MaxNLocator, FormatStrFormatter, LinearLocator  # 如果文件顶部已经导入可省略
+from matplotlib.ticker import MaxNLocator, FormatStrFormatter  # 如果文件顶部已经导入可省略
 import matplotlib.ticker as ticker
-import shap
+import shap  # type: ignore[reportMissingImports]
 import matplotlib.gridspec as gridspec
-import matplotlib.ticker as mticker
 import matplotlib.patches as mpatches
-import optuna.visualization as vis
 from scipy.stats import gaussian_kde
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from matplotlib.colors import to_rgba
-from mpl_toolkits.mplot3d import Axes3D  # 确保3D支持
+from mpl_toolkits.mplot3d import Axes3D  # type: ignore[reportUnusedImport]
 from matplotlib.lines import Line2D
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-from matplotlib.patches import FancyArrow
 # from matplotlib import colors
-import textwrap
 from scipy.ndimage import zoom
 import warnings
-from scipy.spatial.distance import pdist
+from typing import cast
 warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+# Global font settings for all plots.
+matplotlib.rcParams["font.family"] = "sans-serif"
+matplotlib.rcParams["font.sans-serif"] = ["Helvetica", "Arial", "DejaVu Sans"]
+matplotlib.rcParams["axes.unicode_minus"] = False
 
 #save pt
 def _resolve_run_id(run_id: str | None) -> str | None:
@@ -209,7 +209,7 @@ def plot_mic_network_heatmap(feature_df: pd.DataFrame,
             plt.style.use("chartlab.mplstyle")
         except Exception:
             pass
-        plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "Arial", "DejaVu Sans"]
+        plt.rcParams["font.sans-serif"] = ["Helvetica", "Arial", "DejaVu Sans"]
         plt.rcParams["axes.unicode_minus"] = False
         plt.rcParams["xtick.major.size"] = 0
         plt.rcParams["ytick.major.size"] = 0
@@ -229,13 +229,13 @@ def plot_mic_network_heatmap(feature_df: pd.DataFrame,
     def _mic(x: np.ndarray, y: np.ndarray) -> float:
         """MIC；若 minepy 不可用则退化为 distance‑correlation / Pearson"""
         try:
-            from minepy import MINE
+            from minepy import MINE  # type: ignore[reportMissingImports]
             mine = MINE(alpha=0.6, c=15)
             mine.compute_score(x, y)
             return float(mine.mic())
         except Exception:
             try:
-                import dcor
+                import dcor  # type: ignore[reportMissingImports]
                 return float(dcor.distance_correlation(x, y))
             except Exception:
                 val = float(np.corrcoef(x, y)[0, 1])
@@ -257,7 +257,7 @@ def plot_mic_network_heatmap(feature_df: pd.DataFrame,
                 else:
                     # distance‑correlation（若 dcor 不在则用 |Pearson|）
                     try:
-                        import dcor
+                        import dcor  # type: ignore[reportMissingImports]
                         score = abs(dcor.distance_correlation(xi[:m], xj[:m]))
                     except Exception:
                         score = abs(np.corrcoef(xi[:m], xj[:m])[0, 1])
@@ -321,7 +321,7 @@ def plot_mic_network_heatmap(feature_df: pd.DataFrame,
         # -------------------- 颜色条：放到左下角 --------------------
         # ① 位置：把原来的 [0.89, 0.15, 0.03, 0.25]
         #    改成左下角一个小条；示例占据图宽 25%、高 3%
-        cb_ax = fig.add_axes([0.15, 0.25, 0.25, 0.03])  # [left, bottom, width, height]
+        cb_ax = fig.add_axes((0.15, 0.25, 0.25, 0.03))  # [left, bottom, width, height]
 
         # ② 水平 colorbar
         cb = plt.colorbar(
@@ -341,11 +341,12 @@ def plot_mic_network_heatmap(feature_df: pd.DataFrame,
         #    – 刻度
         for t in cb.ax.get_xticklabels():
             t.set_rotation(45)
-            t.set_ha("right")  # 让文字贴着刻度略微往内收
+            t.set_horizontalalignment("right")  # 让文字贴着刻度略微往内收
             t.set_fontsize(11)
 
         # ④ 额外：去掉 colorbar 的外框使更简洁
-        cb.outline.set_visible(False)
+        for spine in cb.ax.spines.values():
+            spine.set_visible(False)
 
     # 细节 & 保存
     ax.set_xticklabels([]); ax.set_yticklabels([])
@@ -360,7 +361,7 @@ def plot_mic_network_heatmap(feature_df: pd.DataFrame,
     # 去掉整张图的外框线
     for spine in ax.spines.values():
         spine.set_visible(False)
-    plt.tight_layout(rect=[0, 0, 0.88, 1])
+    plt.tight_layout(rect=(0, 0, 0.88, 1))
     plt.savefig(filename, dpi=dpi)
     plt.close()
     print(f"[plot_mic_network_heatmap] → {filename}")
@@ -401,6 +402,8 @@ def plot_joint_scatter_with_marginals(y_true, y_pred, y_labels=None, filename="j
       filename : Name of the file to save the plot.
     """
     ensure_dir_for_file(filename)
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
     if y_true.ndim != 2 or y_pred.ndim != 2:
         raise ValueError("y_true and y_pred must be 2-dimensional arrays, shaped as (N, out_dim)")
 
@@ -428,8 +431,8 @@ def plot_joint_scatter_with_marginals(y_true, y_pred, y_labels=None, filename="j
         sc = ax.scatter(x, y, c=density_xy, cmap=cmap_main, alpha=0.5, edgecolor='none')
 
         # Draw perfect prediction line using data min and max.
-        min_val = min(x.min(), y.min())
-        max_val = max(x.max(), y.max())
+        min_val = float(np.min([np.min(x), np.min(y)]))
+        max_val = float(np.max([np.max(x), np.max(y)]))
         ax.plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=1.5)
 
         # Set axis labels and title，字体统一设置为 fontsize=10
@@ -475,7 +478,7 @@ def plot_joint_scatter_with_marginals(y_true, y_pred, y_labels=None, filename="j
         segments_x = []
         colors_x = []
         # Use KDE values (density) for color mapping.
-        norm_kde_x = mcolors.Normalize(vmin=kde_x_vals.min(), vmax=kde_x_vals.max())
+        norm_kde_x = mcolors.Normalize(vmin=np.min(kde_x_vals), vmax=np.max(kde_x_vals))
         for j in range(len(x_vals) - 1):
             x0, x1 = x_vals[j], x_vals[j + 1]
             d0, d1 = kde_x_vals[j], kde_x_vals[j + 1]
@@ -485,7 +488,7 @@ def plot_joint_scatter_with_marginals(y_true, y_pred, y_labels=None, filename="j
         pc_x = PolyCollection(segments_x, facecolors=colors_x, edgecolors='none', alpha=0.8)
         ax_histx.plot(x_vals, kde_x_vals, color='darkblue', linewidth=1.2, alpha=0.5)
         ax_histx.add_collection(pc_x)
-        ax_histx.set_ylim(0, kde_x_vals.max())
+        ax_histx.set_ylim(0, np.max(kde_x_vals))
         ax_histx.axis('off')
 
         # --- Right marginal (y): gradient-filled KDE for predicted values ---
@@ -498,7 +501,7 @@ def plot_joint_scatter_with_marginals(y_true, y_pred, y_labels=None, filename="j
         segments_y = []
         colors_y = []
         # Use KDE values (density) for color mapping.
-        norm_kde_y = mcolors.Normalize(vmin=kde_y_vals.min(), vmax=kde_y_vals.max())
+        norm_kde_y = mcolors.Normalize(vmin=np.min(kde_y_vals), vmax=np.max(kde_y_vals))
         for j in range(len(y_vals) - 1):
             y0, y1 = y_vals[j], y_vals[j + 1]
             d0, d1 = kde_y_vals[j], kde_y_vals[j + 1]
@@ -508,7 +511,7 @@ def plot_joint_scatter_with_marginals(y_true, y_pred, y_labels=None, filename="j
         pc_y = PolyCollection(segments_y, facecolors=colors_y, edgecolors='none', alpha=0.8)
         ax_histy.plot(kde_y_vals, y_vals, color='darkred', linewidth=1.2, alpha=0.5)
         ax_histy.add_collection(pc_y)
-        ax_histy.set_xlim(0, kde_y_vals.max())
+        ax_histy.set_xlim(0, np.max(kde_y_vals))
         ax_histy.axis('off')
 
     plt.tight_layout()
@@ -555,7 +558,7 @@ def plot_kde_distribution(df, columns, filename):
     fig, axes = plt.subplots(nrows, ncols,
                              figsize=(4 * ncols, 4 * nrows),
                              squeeze=False)
-    axes = axes.flatten()
+    axes = np.ravel(axes)
 
     for i, col in enumerate(columns):
         ax = axes[i]
@@ -580,7 +583,7 @@ def plot_kde_distribution(df, columns, filename):
         x_plot, y_plot = x_plot[idxsort], y_plot[idxsort]
 
         # build gradient fill under curve
-        vmin, vmax = x_plot.min(), x_plot.max()
+        vmin, vmax = float(np.min(x_plot)), float(np.max(x_plot))
         cmap = cm.get_cmap("coolwarm")
         norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
 
@@ -595,9 +598,16 @@ def plot_kde_distribution(df, columns, filename):
                                   alpha=0.6)
             ax.add_collection(poly)
 
-        # labels
-        ax.set_xlabel(col, fontsize=12)
-        ax.set_ylabel("Density", fontsize=12)
+        # labels (slightly larger for data analysis plots)
+        label_size = 14
+        tick_size = 11
+        cb_label_size = 12
+        cb_tick_size = 10
+        offset_size = 10
+
+        ax.set_xlabel(col, fontsize=label_size)
+        ax.set_ylabel("Density", fontsize=label_size)
+        ax.tick_params(axis="both", labelsize=tick_size)
         ax.set_xlim(vmin, vmax)
 
         # y-axis formatting
@@ -605,14 +615,14 @@ def plot_kde_distribution(df, columns, filename):
         fmt = MyScalarFormatter(useMathText=True)
         fmt.set_powerlimits((0, 0))
         ax.yaxis.set_major_formatter(fmt)
-        ax.yaxis.get_offset_text().set_fontsize(9)
+        ax.yaxis.get_offset_text().set_fontsize(offset_size)
 
         # colorbar
         sm = cm.ScalarMappable(norm=norm, cmap=cmap)
         sm.set_array([])
         cb = plt.colorbar(sm, ax=ax, pad=0.02)
-        cb.set_label("Value", fontsize=10)
-        cb.ax.tick_params(labelsize=9)
+        cb.set_label("Value", fontsize=cb_label_size)
+        cb.ax.tick_params(labelsize=cb_tick_size)
 
     # hide any unused axes
     for j in range(n, len(axes)):
@@ -708,7 +718,7 @@ def plot_shap_importance(
     ensure_dir_for_file(os.path.join(output_path, "dummy.txt"))  # 确保目录存在
 
     shap_values = shap_data["shap_values"]
-    X_full = shap_data["X_full"]
+    X_full = np.asarray(shap_data["X_full"])
     x_col_names = shap_data["x_col_names"]
     y_col_names = shap_data["y_col_names"]
 
@@ -724,9 +734,10 @@ def plot_shap_importance(
 
     # 对每个输出分别绘图
     for idx, sv in enumerate(shap_values):
+        sv_arr = np.asarray(sv)
         # 计算 mean(|SHAP|) 作为特征重要性
         # sv 形状 (n_samples, n_features)
-        mean_abs_shap = np.mean(np.abs(sv), axis=0)  # (n_features, )
+        mean_abs_shap = np.mean(np.abs(sv_arr), axis=0)  # (n_features, )
 
         # 取 top_n_features
         sorted_idx = np.argsort(mean_abs_shap)[::-1]  # 降序
@@ -829,10 +840,12 @@ def plot_shap_beeswarm(
         else:
             out_name = "shap_beeswarm.jpg"
 
+        sv_arr = np.asarray(sv)
+        X_full_arr = np.asarray(X_full)
         # 调用 shap.summary_plot 生成 beeswarm
         shap.summary_plot(
-            sv,
-            features=X_full,
+            sv_arr,
+            features=X_full_arr,
             feature_names=x_col_names,
             show=False,
             max_display=top_n_features,
@@ -921,7 +934,7 @@ def plot_shap_importance_multi_output(
     shap_matrix = np.zeros((n_features, n_outputs), dtype=np.float64)
 
     for i in range(n_outputs):
-        sv_i = shap_values[i]  # (n_samples, n_features)
+        sv_i = np.asarray(shap_values[i])  # (n_samples, n_features)
         mean_abs_i = np.mean(np.abs(sv_i), axis=0)  # (n_features,)
         shap_matrix[:, i] = mean_abs_i
 
@@ -1045,10 +1058,11 @@ def plot_shap_combined(
         multi_output = True
 
     for idx, sv in enumerate(shap_values):
+        sv_arr = np.asarray(sv)
         # -------------------------------
         # 1. 计算每个特征的平均绝对 SHAP 值
         # -------------------------------
-        mean_abs_shap = np.squeeze(np.mean(np.abs(sv), axis=0))  # (n_features,)
+        mean_abs_shap = np.squeeze(np.mean(np.abs(sv_arr), axis=0))  # (n_features,)
         sorted_idx = np.argsort(mean_abs_shap)[::-1]             # 降序排序：第一项最高
         top_idx = sorted_idx[:top_n_features]
         top_idx = [int(i) for i in top_idx]  # 转换为标准整型
@@ -1057,7 +1071,7 @@ def plot_shap_combined(
         top_feats = [x_col_names[i] for i in top_idx]
 
         # 重新排列 SHAP 值和原始数据，使得 beeswarm 图按同一顺序显示
-        sv_sorted = sv[:, top_idx]
+        sv_sorted = sv_arr[:, top_idx]
         X_sorted = X_full[:, top_idx]
         feat_sorted = top_feats[:]  # 复制
 
@@ -1151,7 +1165,7 @@ def plot_shap_combined(
             out_file = "shap_combined.jpg"
             # fig.suptitle("SHAP Combined Plot", fontsize=16)
 
-        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        plt.tight_layout(rect=(0, 0, 1, 0.95))
         save_path = os.path.join(output_path, out_file)
         plt.savefig(save_path, dpi=700, format='jpg')
         plt.close(fig)
@@ -1447,7 +1461,7 @@ def plot_cv_metrics(cv_metrics: dict,
     ax_a = fig.add_subplot(gs[0, 0])
     ax_b = fig.add_subplot(gs[0, 1])
     ax_c = fig.add_subplot(gs[1, 0])
-    ax_d = fig.add_subplot(gs[1, 1], polar=True)
+    ax_d = cast(PolarAxes, fig.add_subplot(gs[1, 1], polar=True))
 
     subplot_font = {"size": 14}
 
@@ -1476,7 +1490,7 @@ def plot_cv_metrics(cv_metrics: dict,
                     ha="left", va="top", fontdict=subplot_font)
 
         # 注释
-        right_lim = 1.5 * vals.max()           # ← 改：固定 0 → 1.5·max
+        right_lim = 1.5 * float(np.max(vals))           # ← 改：固定 0 → 1.5·max
         shift = 0.03 * right_lim
         for xv, yv in zip(vals, y[::-1]):
             ax.text(xv + shift, yv, f"{xv:.2f}",
@@ -1512,7 +1526,7 @@ def plot_cv_metrics(cv_metrics: dict,
                     "#3C5488", "#F39B7F", "#8491B4"]
 
     for idx, model in enumerate(model_names):
-        vals = norm_data[model] + norm_data[model][:1]
+        vals = np.asarray(norm_data[model] + norm_data[model][:1], dtype=float)
         color = radar_colors[idx % len(radar_colors)]
         ax_d.plot(angles, vals, lw=2, color=color, label=model)
         ax_d.fill(angles, vals, color=color, alpha=0.25)
@@ -1602,8 +1616,12 @@ def plot_cv_boxplot(
     )
 
     # 着色
-    for p in bp_tr["boxes"]: p.set_facecolor(color_train), p.set_alpha(0.55)
-    for p in bp_va["boxes"]: p.set_facecolor(color_val),   p.set_alpha(0.55)
+    for p in bp_tr["boxes"]:
+        p.set_facecolor(color_train)
+        p.set_alpha(0.55)
+    for p in bp_va["boxes"]:
+        p.set_facecolor(color_val)
+        p.set_alpha(0.55)
 
     plt.setp(bp_tr["medians"], color="black", linewidth=2)
     plt.setp(bp_va["medians"], color="black", linewidth=2)
@@ -1723,7 +1741,7 @@ def plot_overfitting_horizontal(overfit_data,
 
         # -------- 数值注释 --------
         # 改动：横坐标上限至少为 1.25 × threshold_h
-        value_lim = max(1.25 * threshold_h, 1.8 * vals.max())
+        value_lim = max(1.25 * threshold_h, 1.8 * float(np.max(vals)))
         shift = 0.03 * value_lim
         for xv, yv in zip(vals, y_pos[::-1]):
             ax.text(xv + shift, yv, f"{xv:.2f}",
@@ -1731,6 +1749,7 @@ def plot_overfitting_horizontal(overfit_data,
                     fontsize=12)
 
         # -------- 阈值阴影区 --------
+        zones: list[Artist]
         if threshold_l == 0:
             ax.axvspan(0, threshold_h, color=GRAY, alpha=0.2, zorder=0)
             zones = [Patch(facecolor=GRAY, alpha=0.2, label="Acceptable")]
@@ -1785,6 +1804,7 @@ class OnlyPositiveNoZeroLocator(ticker.Locator):
     def __init__(self, nbins=6):
         self.nbins = nbins
     def __call__(self):
+        assert self.axis is not None
         vmin, vmax = self.axis.get_data_interval()
         lower = max(0, min(vmin, vmax))
         upper = max(vmax, lower)
@@ -1804,6 +1824,7 @@ class OnlyPositiveIntegerLocator(ticker.Locator):
     def __init__(self, nbins=4):
         self.nbins = nbins
     def __call__(self):
+        assert self.axis is not None
         vmin, vmax = self.axis.get_data_interval()
         lower = max(5, int(np.ceil(vmin)))
         upper = int(np.floor(vmax))
@@ -1859,11 +1880,12 @@ def plot_multi_model_residual_distribution_single_dim(
     if not residuals_dict:
         print("[plot_multi_model_residual_distribution_single_dim] => empty dict, skip.")
         return
+    residuals_dict = {m: np.asarray(residuals_dict[m]) for m in residuals_dict}
 
     # 收集数据
     all_data_list = []
     for m in residuals_dict:
-        arr = residuals_dict[m]
+        arr = np.asarray(residuals_dict[m])
         if arr.size==0:
             warnings.warn(f"Model {m} has empty residual array.")
         else:
@@ -1901,10 +1923,10 @@ def plot_multi_model_residual_distribution_single_dim(
     hist_counts_dict = {}
     max_count = 0
     for m in model_names:
-        arr = residuals_dict[m]
+        arr = np.asarray(residuals_dict[m])
         counts, _ = np.histogram(arr, bins=edges)
         hist_counts_dict[m] = counts
-        cmax = counts.max()
+        cmax = int(np.max(counts))
         if cmax>max_count:
             max_count=cmax
 
@@ -1946,7 +1968,7 @@ def plot_multi_model_residual_distribution_single_dim(
     # ========== 右轴: KDE + rug ==========
     max_density = 0
     for i,m in enumerate(model_names):
-        arr = residuals_dict[m]
+        arr = np.asarray(residuals_dict[m])
         color_ = color_palette[i]
         # KDE
         kde_obj = sns.kdeplot(
@@ -1955,9 +1977,9 @@ def plot_multi_model_residual_distribution_single_dim(
             linewidth=2, bw_adjust=0.8
         )
         if kde_obj.lines:
-            ydata = kde_obj.lines[-1].get_ydata()
-            if ydata.size>0:
-                cur_max = ydata.max()
+            ydata = np.asarray(kde_obj.lines[-1].get_ydata())
+            if ydata.size > 0:
+                cur_max = float(np.max(ydata))
                 if cur_max>max_density:
                     max_density=cur_max
 
@@ -2092,7 +2114,7 @@ def plot_optuna_summary_curve(trials_dict, out_path):
             best_x = trials_df.loc[best_idx, "number"]
         else:
             best_x = best_idx
-        best_y = y.min()
+        best_y = float(np.min(y))
         plt.plot(best_x, best_y, marker='*', markersize=14,
                  color=color, linestyle='None', label=f"{mtype} Best")
 
@@ -2105,7 +2127,7 @@ def plot_optuna_summary_curve(trials_dict, out_path):
                ncol=len(trials_dict), fontsize=8, frameon=False)
 
     # 调整布局，留出图例所需空间
-    plt.tight_layout(rect=[0, 0, 1, 0.13])
+    plt.tight_layout(rect=(0, 0, 1, 0.13))
     plt.savefig(out_path, dpi=700)
     plt.close()
     print(f"[INFO] Custom styled Optuna Summary Curve saved => {out_path}")
@@ -2137,7 +2159,7 @@ def plot_optuna_slice(trials_df, params, out_path):
         ax.set_ylabel("Objective Value", fontsize=14, color="black")
         ax.tick_params(labelsize=12, colors="black")
     # fig.suptitle("Parameter Slice Plot", fontsize=18, color="black")
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.tight_layout(rect=(0, 0, 1, 0.96))
     plt.savefig(out_path, dpi=700)
     plt.close()
     print(f"[INFO] Custom styled Optuna Slice Plot saved => {out_path}")
@@ -2225,6 +2247,9 @@ def _upsample_grid(grid_x, grid_y, Z, smooth=4, order=3):
     将规则网格 (grid_x, grid_y, Z) 用 scipy.ndimage.zoom 做双三次插值，
     让图面更平滑。smooth=4 表示行、列各细分 4 倍。
     """
+    grid_x = np.asarray(grid_x)
+    grid_y = np.asarray(grid_y)
+    Z = np.asarray(Z)
     if smooth <= 1:
         return grid_x, grid_y, Z                # 不插值
 
@@ -2236,8 +2261,10 @@ def _upsample_grid(grid_x, grid_y, Z, smooth=4, order=3):
     Z_fine = zoom(Z, zoom_factor, order=order)
 
     # 对应生成新的等间距网格坐标
-    x_vals = np.linspace(grid_x.min(), grid_x.max(), W * smooth)
-    y_vals = np.linspace(grid_y.min(), grid_y.max(), H * smooth)
+    x_min, x_max = float(np.min(grid_x)), float(np.max(grid_x))
+    y_min, y_max = float(np.min(grid_y)), float(np.max(grid_y))
+    x_vals = np.linspace(x_min, x_max, W * smooth)
+    y_vals = np.linspace(y_min, y_max, H * smooth)
     grid_x_fine, grid_y_fine = np.meshgrid(x_vals, y_vals)
 
     return grid_x_fine, grid_y_fine, Z_fine
@@ -2259,6 +2286,9 @@ def plot_2d_heatmap_from_npy(grid_x, grid_y, heatmap_pred,
               设 1 则保持原始分辨率。
     """
     os.makedirs(out_dir, exist_ok=True)
+    grid_x = np.asarray(grid_x)
+    grid_y = np.asarray(grid_y)
+    heatmap_pred = np.asarray(heatmap_pred)
     _, _, out_dim = heatmap_pred.shape
 
     for odx in range(out_dim):
@@ -2268,8 +2298,11 @@ def plot_2d_heatmap_from_npy(grid_x, grid_y, heatmap_pred,
                                          heatmap_pred[:, :, odx],
                                          smooth=smooth,
                                          order=3)   # 双三次
+        gx_f = np.asarray(gx_f)
+        gy_f = np.asarray(gy_f)
+        z_f = np.asarray(z_f)
 
-        auto_min, auto_max = z_f.min(), z_f.max()
+        auto_min, auto_max = float(np.min(z_f)), float(np.max(z_f))
         if stats_dict and y_col_names and odx < len(y_col_names) \
            and y_col_names[odx] in stats_dict:
             real_min = stats_dict[y_col_names[odx]]["min"]
@@ -2321,6 +2354,7 @@ def plot_3d_surface_from_heatmap(grid_x, grid_y, heatmap_pred,
                                  cmap_name="GnBu",
                                  smooth=4):          # ← 新增
     os.makedirs(out_dir, exist_ok=True)
+    heatmap_pred = np.asarray(heatmap_pred)
     _, _, out_dim = heatmap_pred.shape
 
     for odx in range(out_dim):
@@ -2330,8 +2364,11 @@ def plot_3d_surface_from_heatmap(grid_x, grid_y, heatmap_pred,
                                          heatmap_pred[:, :, odx],
                                          smooth=smooth,
                                          order=3)
+        gx_f = np.asarray(gx_f)
+        gy_f = np.asarray(gy_f)
+        Z_f = np.asarray(Z_f)
 
-        auto_min, auto_max = Z_f.min(), Z_f.max()
+        auto_min, auto_max = float(np.min(Z_f)), float(np.max(Z_f))
         if stats_dict and y_col_names and odx < len(y_col_names) \
            and y_col_names[odx] in stats_dict:
             real_min = stats_dict[y_col_names[odx]]["min"]
@@ -2343,7 +2380,9 @@ def plot_3d_surface_from_heatmap(grid_x, grid_y, heatmap_pred,
 
         norm_ = mcolors.Normalize(vmin=vmin_, vmax=vmax_)
         cmap_ = plt.get_cmap(cmap_name)
-        colors_rgba = cmap_(norm_(Z_f.flatten())).reshape(Z_f.shape + (4,))
+        colors_rgba = np.asarray(cmap_(norm_(np.ravel(Z_f)))).reshape(
+            (Z_f.shape[0], Z_f.shape[1], 4)
+        )
 
         fig = plt.figure(figsize=(8, 6))
         ax = fig.add_subplot(111, projection="3d")
@@ -2355,7 +2394,7 @@ def plot_3d_surface_from_heatmap(grid_x, grid_y, heatmap_pred,
                         antialiased=True,   # ← 抗锯齿
                         shade=False)
 
-        sm = matplotlib.cm.ScalarMappable(norm=norm_, cmap=cmap_)
+        sm = cm.ScalarMappable(norm=norm_, cmap=cmap_)
         sm.set_array([])
         cb = plt.colorbar(sm, ax=ax, shrink=0.7, pad=0.1, aspect=15)
         cb.set_label(y_col_names[odx] if y_col_names and odx < len(y_col_names)
@@ -2423,7 +2462,7 @@ def _draw_top_colorbars(fig, cmaps, norms, dim_used, y_col_names,
     - 当 dim_used >  1 时：沿用固定间距 (left0 + k*width)
     """
     for k in range(dim_used):
-        sm = plt.cm.ScalarMappable(norm=norms[k], cmap=cmaps[k])
+        sm = cm.ScalarMappable(norm=norms[k], cmap=cmaps[k])
         sm.set_array([])
 
         if dim_used == 1:
@@ -2432,7 +2471,7 @@ def _draw_top_colorbars(fig, cmaps, norms, dim_used, y_col_names,
         else:
             left = left0 + k * width        # 原排布
 
-        cax = fig.add_axes([left, bottom, width, height])
+        cax = fig.add_axes((left, bottom, width, height))
         cb  = fig.colorbar(sm, cax=cax, orientation='horizontal')
 
         label = (y_col_names[k] if (y_col_names and k < len(y_col_names))
@@ -2456,6 +2495,7 @@ def plot_confusion_from_npy(confusion_pred,
     """
     支持 out_dim == 1 (整块) 及 2–4 维 (四三角) 的混淆矩阵可视化。
     """
+    confusion_pred = np.asarray(confusion_pred)
     n_rows, n_cols, out_dim = confusion_pred.shape
     # 若行标签数量 > 列标签数量，则把行/列对调，
     # 让“元素更多”的那一边作为横轴。
@@ -2473,7 +2513,7 @@ def plot_confusion_from_npy(confusion_pred,
 
     # ───────────── 单输出：整块填色 ───────────── #
     if out_dim == 1:
-        vmin, vmax = confusion_pred.min(), confusion_pred.max()
+        vmin, vmax = float(np.min(confusion_pred)), float(np.max(confusion_pred))
         cmap, norm = plt.get_cmap("Purples"), mcolors.Normalize(vmin, vmax)
 
         fig, ax = plt.subplots(figsize=(16, 10))
@@ -2483,10 +2523,10 @@ def plot_confusion_from_npy(confusion_pred,
         for i in range(n_rows):
             for j in range(n_cols):
                 val = confusion_pred[i, j, 0]
-                ax.add_patch(plt.Rectangle((j*cell_scale, i*cell_scale),
-                                           cell_scale, cell_scale,
-                                           facecolor=cmap(norm(val)),
-                                           edgecolor='black'))
+                ax.add_patch(Rectangle((j * cell_scale, i * cell_scale),
+                                       cell_scale, cell_scale,
+                                       facecolor=cmap(norm(val)),
+                                       edgecolor="black"))
 
         _set_axes(ax, n_rows, n_cols, cell_scale, row_labels, col_labels,
                   row_axis_name, col_axis_name)
@@ -2511,7 +2551,7 @@ def plot_confusion_from_npy(confusion_pred,
     norms = []
     for k in range(dim_used):
         vals = confusion_pred[:, :, k]
-        vmin, vmax = vals.min(), vals.max()
+        vmin, vmax = float(np.min(vals)), float(np.max(vals))
         if (stats_dict and y_col_names and k < len(y_col_names)
                 and y_col_names[k] in stats_dict):
             vmin = stats_dict[y_col_names[k]]["min"]
@@ -2539,9 +2579,9 @@ def plot_confusion_from_npy(confusion_pred,
                 poly = [(cx + dx*cell_scale, cy + dy*cell_scale)
                         for dx, dy in tri_idx[k]]
                 ax.add_patch(
-                    plt.Polygon(poly,
-                                facecolor=cmaps[k](norms[k](confusion_pred[i, j, k])),
-                                alpha=0.9))
+                    Polygon(poly,
+                            facecolor=cmaps[k](norms[k](confusion_pred[i, j, k])),
+                            alpha=0.9))
 
     _set_axes(ax, n_rows, n_cols, cell_scale, row_labels, col_labels,
               row_axis_name, col_axis_name)
@@ -2568,6 +2608,7 @@ def plot_3d_bars_from_confusion(confusion_pred,
     """
 
     os.makedirs(out_dir, exist_ok=True)
+    confusion_pred = np.asarray(confusion_pred)
     n_rows, n_cols, out_dim = confusion_pred.shape
 
     # 标签处理
@@ -2579,7 +2620,7 @@ def plot_3d_bars_from_confusion(confusion_pred,
     # 我们在此不限制维度个数，每个维度绘制一个图
     for odx in range(out_dim):
         all_vals_dim = confusion_pred[:, :, odx]
-        auto_min, auto_max = all_vals_dim.min(), all_vals_dim.max()
+        auto_min, auto_max = float(np.min(all_vals_dim)), float(np.max(all_vals_dim))
 
         if (stats_dict is not None) and (y_col_names is not None) \
            and (odx < len(y_col_names)) and (y_col_names[odx] in stats_dict):
@@ -2640,7 +2681,7 @@ def plot_3d_bars_from_confusion(confusion_pred,
         ax.set_zlabel("Value", fontsize=12)
 
         # 颜色条
-        sm = plt.cm.ScalarMappable(norm=norm_, cmap=cmap_)
+        sm = cm.ScalarMappable(norm=norm_, cmap=cmap_)
         sm.set_array([])  # 不对应具体数组，只作颜色映射
         cb_ = plt.colorbar(sm, ax=ax, shrink=0.6, pad=0.1, aspect=15)
 
@@ -2680,13 +2721,17 @@ def plot_3d_surface_from_3d_heatmap(
     alpha_gamma : 线性 γ 偏置；>1 更突出高值；<1 整体更实
     """
     os.makedirs(out_dir, exist_ok=True)
+    grid_x = np.asarray(grid_x)
+    grid_y = np.asarray(grid_y)
+    grid_z = np.asarray(grid_z)
+    heatmap_pred = np.asarray(heatmap_pred)
 
     Zval = heatmap_pred[..., out_idx]           # (H,W,D)
-    vmin_, vmax_ = float(Zval.min()), float(Zval.max())
+    vmin_, vmax_ = float(np.min(Zval)), float(np.max(Zval))
     norm_  = mcolors.Normalize(vmin_, vmax_)
     cmap_  = plt.get_cmap(cmap_name)
 
-    rgba   = cmap_(norm_(Zval))                 # (H,W,D,4)
+    rgba = np.asarray(cmap_(norm_(Zval)))       # (H,W,D,4)
     alpha_base = norm_(Zval) ** alpha_gamma     # 0-1 after γ
     if alpha_mode == "value":                   # 大值 → 不透明
         rgba[..., -1] = alpha_base
@@ -2706,7 +2751,7 @@ def plot_3d_surface_from_3d_heatmap(
                         linewidth=0, antialiased=True, shade=False)
 
     # ——— color-bar ———
-    sm = plt.cm.ScalarMappable(norm=norm_, cmap=cmap_)
+    sm = cm.ScalarMappable(norm=norm_, cmap=cmap_)
     sm.set_array([])
     cb = plt.colorbar(sm, ax=ax, shrink=0.7, pad=0.1, aspect=15)
     cb.set_label(

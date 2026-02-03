@@ -361,25 +361,43 @@ def visualize_main():
 
         # 数据分析图
         if config["evaluation"].get("save_data_analysis_plots", False):
-            possible_cols = ["Molar ratio (Zn:Cu)",
-                             "Promoter 1 ratio (Promoter 1:Cu)",
-                             "Promoter 2 ratio (Promoter 2:Cu)",
-                             "Catalyst surface area (m2/g) (LN scale)",
-                             "Calcination temperature (°C)",
-                             "GHSV (mL/g.h) (LN scale)",
-                             "Temperature (°C)",
-                             "Pressure (bar)",
-                             "H2/CO2 ratio (-)",
-                             "GHSV (mL/g.h)",
-                             "Catalyst loading (g)",
-                             "Methanol selectivity (%)",
-                             "CO2 conversion efficiency (%)",
-                             "STY_CH3OH (g/kg·h) (LN scale)",
-                             "CO selectivity (%)"]
-            existing_cols = [c for c in possible_cols if c in df_raw_14.columns]
+            df_plot = df_raw_14.copy()
+            # 仅用于出图：将 Calcination time (h) 转成 LN scale，不改原始数据
+            if ("Calcination time (h) (LN scale)" not in df_plot.columns
+                    and "Calcination time (h)" in df_plot.columns):
+                log_eps = 1e-8
+                ct = pd.to_numeric(df_plot["Calcination time (h)"], errors="coerce")
+                ct = ct.clip(lower=log_eps)
+                df_plot["Calcination time (h) (LN scale)"] = np.log(ct)
+            # 仅用于出图：将 Molar ratio (Zn:Cu) 转成 LN scale，不改原始数据
+            if ("Molar ratio (Zn:Cu) (LN scale)" not in df_plot.columns
+                    and "Molar ratio (Zn:Cu)" in df_plot.columns):
+                log_eps = 1e-8
+                mr = pd.to_numeric(df_plot["Molar ratio (Zn:Cu)"], errors="coerce")
+                mr = mr.clip(lower=log_eps)
+                df_plot["Molar ratio (Zn:Cu) (LN scale)"] = np.log(mr)
+            possible_cols = [
+                "Molar ratio (Zn:Cu) (LN scale)",
+                "Promoter 1 ratio (Promoter 1:Cu)",
+                "Promoter 2 ratio (Promoter 2:Cu)",
+                "Catalyst surface area (m2/g) (LN scale)",
+                "Calcination temperature (°C)",
+                "Calcination time (h) (LN scale)",
+                "Temperature (°C)",
+                "Pressure (bar)",
+                "H2/CO2 ratio (-)",
+                "GHSV (mL/g.h) (LN scale)",
+                "GHSV (mL/g.h)",
+                "Catalyst loading (g)",
+                "CO selectivity (%)",
+                "Methanol selectivity (%)",
+                "STY_CH3OH (g/kg·h) (LN scale)",
+                "CO2 conversion efficiency (%)",
+            ]
+            existing_cols = [c for c in possible_cols if c in df_plot.columns]
             if existing_cols:
                 out_kde = os.path.join(data_corr_dir, "kde_distribution.jpg")
-                plot_kde_distribution(df_raw_14, existing_cols, filename=out_kde)
+                plot_kde_distribution(df_plot, existing_cols, filename=out_kde)
     else:
         print(f"[WARN] df_raw_14.csv not found => {raw_csv_path}")
 

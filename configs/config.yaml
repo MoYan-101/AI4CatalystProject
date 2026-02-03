@@ -21,6 +21,10 @@ data_loader:
     - "Promoter 2 ratio (Promoter 2:Cu)"
   element_embedding: "advanced"
   promoter_onehot: true
+  log_transform_cols:
+    - "Calcination time (h)"
+    - "Molar ratio (Zn:Cu)"
+  log_transform_eps: 1e-8
 
 # 预处理配置
 preprocessing:

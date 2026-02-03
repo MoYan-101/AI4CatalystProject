@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple, Set, Any
+from typing import Any, Dict, List, Optional, Protocol, Sequence, Set, Tuple, cast
 from collections import Counter, defaultdict
 import csv
 import os
@@ -28,6 +28,22 @@ _DEFAULT_NA_STRINGS = {
     "", " ", "none", "nan", "na", "n/a",
     "NONE", "NaN", "NA", "N/A", "None"
 }
+
+
+class MaterialFeaturizer(Protocol):
+    @property
+    def dim(self) -> int:
+        ...
+
+    @property
+    def feature_labels(self) -> List[str]:
+        ...
+
+    def featurize(self, material: Optional[str]) -> np.ndarray:
+        ...
+
+    def print_stats(self) -> None:
+        ...
 
 
 def _normalize_missing(x):
@@ -282,11 +298,12 @@ def _impute_missing_values_kde(
     for col_name in number_cols:
         col_raw = df[col_name]
         col_num = pd.to_numeric(col_raw, errors="coerce")
-        observed = col_num.dropna().values
+        observed = np.asarray(col_num.dropna().to_numpy(dtype=np.float32))
         n_missing = int(col_num.isna().sum())
 
         # If non-numeric column was misclassified, fall back to categorical imputation.
-        if observed.size == 0 and col_raw.dropna().size > 0:
+        raw_non_null = np.asarray(col_raw.dropna().to_numpy())
+        if observed.size == 0 and raw_non_null.size > 0:
             extra_type_cols.append(col_name)
             continue
 
@@ -384,8 +401,7 @@ class AdvancedMaterialFeaturizer:
     5. 无法识别 -> 特殊处理
     """
     def __init__(self):
-        self._magpie = None
-        self._text_embedder = None
+        self._magpie: MagpieFeaturizer | None = None
         self._common_elements = None
         self.stats = {
             'single_elements': Counter(),
@@ -397,23 +413,10 @@ class AdvancedMaterialFeaturizer:
         }
 
     @property
-    def magpie(self):
+    def magpie(self) -> "MagpieFeaturizer":
         if self._magpie is None:
             self._magpie = MagpieFeaturizer()
         return self._magpie
-
-    @property
-    def text_embedder(self):
-        if self._text_embedder is None:
-            try:
-                self._text_embedder = TextEmbedder(
-                    model_name="sentence-transformers/all-MiniLM-L6-v2",
-                    normalize=True
-                )
-            except ImportError:
-                print("警告: 无法加载文本嵌入器，将使用备用特征")
-                self._text_embedder = None
-        return self._text_embedder
 
     @property
     def dim(self) -> int:
@@ -610,31 +613,11 @@ class AdvancedMaterialFeaturizer:
 
     def _handle_text_description(self, text: str) -> np.ndarray:
         """处理文本描述：使用NLP嵌入"""
-        try:
-            # 检查是否有文本嵌入器
-            if self.text_embedder is None:
-                raise ImportError("文本嵌入器不可用")
-
-            # 获取文本嵌入
-            embedding = self.text_embedder.encode([text])[0]
-
-            # 将嵌入维度调整到Magpie维度
-            if len(embedding) > self.dim:
-                # 如果嵌入维度更高，截断
-                embedding = embedding[:self.dim]
-            elif len(embedding) < self.dim:
-                # 如果嵌入维度更低，填充
-                padding = np.zeros(self.dim - len(embedding), dtype=np.float32)
-                embedding = np.concatenate([embedding, padding])
-
-            return embedding
-
-        except Exception as e:
-            # NLP失败，返回特殊标记
-            features = np.ones(self.dim, dtype=np.float32) * 0.1  # 特殊值，区别于0
-            if features.shape[0] > 0:
-                features[-1] = 0.8  # 文本描述标志
-            return features
+        # 不使用文本嵌入器：直接返回特殊标记向量
+        features = np.ones(self.dim, dtype=np.float32) * 0.1  # 特殊值，区别于0
+        if features.shape[0] > 0:
+            features[-1] = 0.8  # 文本描述标志
+        return features
 
     def featurize(self, material: Optional[str]) -> np.ndarray:
         """
@@ -750,7 +733,9 @@ class AdvancedMaterialFeaturizer:
 @dataclass
 class MagpieFeaturizer:
     """原始Magpie元素特征器"""
-    _featurizer: object = None
+    _featurizer: Any = None
+    _Composition: Any = None
+    _feature_labels: Optional[List[str]] = None
 
     def _ensure(self):
         if self._featurizer is not None:
@@ -773,19 +758,21 @@ class MagpieFeaturizer:
     @property
     def dim(self) -> int:
         self._ensure()
+        assert self._feature_labels is not None
         return len(self._feature_labels)
 
     @property
     def feature_labels(self) -> List[str]:
         self._ensure()
+        assert self._feature_labels is not None
         return self._feature_labels
 
-    def featurize(self, element_symbol: Optional[str]) -> np.ndarray:
+    def featurize(self, material: Optional[str]) -> np.ndarray:
         self._ensure()
-        if element_symbol is None or (isinstance(element_symbol, float) and np.isnan(element_symbol)):
+        if material is None or (isinstance(material, float) and np.isnan(material)):
             return np.zeros(self.dim, dtype=np.float32)
 
-        sym = str(element_symbol).strip()
+        sym = str(material).strip()
         if sym == "" or sym.lower() in {"none", "nan"}:
             return np.zeros(self.dim, dtype=np.float32)
         if sym.lower() == "null":
@@ -798,44 +785,9 @@ class MagpieFeaturizer:
             vec = np.zeros(self.dim, dtype=np.float32)
         return vec
 
-
-# -----------------------------
-# 文本嵌入器
-# -----------------------------
-@dataclass
-class TextEmbedder:
-    """文本嵌入器"""
-    model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
-    normalize: bool = False
-    _model: object = None
-    _dim: Optional[int] = None
-
-    def _ensure(self):
-        if self._model is not None:
-            return
-        try:
-            from sentence_transformers import SentenceTransformer
-        except Exception as e:
-            raise ImportError(
-                "Text embedding requires `sentence-transformers`.\n"
-                "Install with:\n"
-                "  pip install sentence-transformers\n"
-            ) from e
-
-        self._model = SentenceTransformer(self.model_name)
-        test = self._model.encode(["test"], normalize_embeddings=self.normalize)
-        self._dim = int(np.asarray(test).shape[1])
-
-    @property
-    def dim(self) -> int:
-        self._ensure()
-        assert self._dim is not None
-        return self._dim
-
-    def encode(self, texts: Sequence[str]) -> np.ndarray:
-        self._ensure()
-        emb = self._model.encode(list(texts), normalize_embeddings=self.normalize)
-        return np.asarray(emb, dtype=np.float32)
+    def print_stats(self) -> None:
+        """兼容接口：Magpie 本身不统计，保持空实现。"""
+        return None
 
 
 # -----------------------------
@@ -843,15 +795,15 @@ class TextEmbedder:
 # -----------------------------
 def load_smart_data_simple(
     csv_path: str,
-    element_cols: Tuple[str, str] = ("Promoter 1", "Promoter 2"),
+    element_cols: tuple[str, ...] = ("Promoter 1", "Promoter 2"),
     text_cols: Tuple[str, ...] = ("Type of sysnthesis procedure",),
     y_cols: Optional[Sequence[str]] = None,
     promoter_ratio_cols: Optional[Sequence[str]] = None,
     promoter_onehot: bool = True,
+    log_transform_cols: Optional[Sequence[str]] = None,
+    log_transform_eps: float = 1e-8,
     # 特征器配置
     element_embedding: str = "advanced",  # "basic" 或 "advanced"
-    text_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
-    text_normalize: bool = False,
     # 其他配置
     drop_metadata_cols: Tuple[str, ...] = ("DOI", "Name", "Year"),
     fill_numeric: str = "median",
@@ -954,6 +906,23 @@ def load_smart_data_simple(
                     fill_val = 0.0
             X_df[c] = col.fillna(fill_val)
 
+    # 可选：对指定数值列做 ln 变换（避免 <=0 取对数的问题）
+    if log_transform_cols:
+        try:
+            eps = float(log_transform_eps) if log_transform_eps is not None else 1e-8
+        except (TypeError, ValueError):
+            eps = 1e-8
+            print(f"[WARN] log_transform_eps='{log_transform_eps}' invalid; fallback to {eps}.")
+        for c in log_transform_cols:
+            if c not in X_df.columns:
+                continue
+            col = pd.to_numeric(X_df[c], errors="coerce")
+            if col.isna().all():
+                continue
+            if (col <= 0).any():
+                print(f"[WARN] log_transform '{c}': non-positive values found, clamping to {eps}.")
+            X_df[c] = np.log(np.clip(col.to_numpy(dtype=np.float32), eps, None))
+
     # 文本列处理
     for c in text_cols:
         X_df[c] = X_df[c].astype("object").where(~X_df[c].isna(), missing_text_token)
@@ -963,6 +932,7 @@ def load_smart_data_simple(
         X_df[c] = X_df[c].astype("object")
 
     # 创建材料特征器
+    element_featurizer: MaterialFeaturizer
     if element_embedding.lower() == "advanced":
         try:
             element_featurizer = AdvancedMaterialFeaturizer()
@@ -1146,7 +1116,7 @@ def load_raw_data_for_correlation(
     output_len: Optional[int] = None,
     drop_nan: bool = True,
     fill_same_as_train: bool = True,
-    element_cols: Tuple[str, str] = ("Promoter 1", "Promoter 2"),
+    element_cols: tuple[str, ...] = ("Promoter 1", "Promoter 2"),
     text_cols: Tuple[str, ...] = ("Type of sysnthesis procedure",),
     drop_metadata_cols: Tuple[str, ...] = ("DOI", "Name", "Year"),
     impute_seed: int = 42,
@@ -1240,8 +1210,6 @@ def build_group_value_vectors(
     element_cols: Sequence[str],
     text_cols: Sequence[str],
     element_embedding: str = "advanced",
-    text_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
-    text_normalize: bool = False,
     observed_value_counts: Optional[Dict[str, Dict[str, int]]] = None,
     observed_value_ratios: Optional[Dict[str, Dict[str, float]]] = None,
     promoter_onehot: bool = True
@@ -1251,7 +1219,7 @@ def build_group_value_vectors(
     """
     group_vectors: Dict[str, Dict[str, Any]] = {}
 
-    element_featurizer = None
+    element_featurizer: MaterialFeaturizer | None = None
     if element_cols:
         if element_embedding.lower() == "advanced":
             try:
@@ -1263,6 +1231,10 @@ def build_group_value_vectors(
             element_featurizer = SimplifiedMaterialFeaturizer()
         else:
             element_featurizer = MagpieFeaturizer()
+
+    if element_cols:
+        assert element_featurizer is not None
+        element_featurizer = cast(MaterialFeaturizer, element_featurizer)
 
     for col in element_cols:
         values = observed_values.get(col, [])
@@ -1560,14 +1532,16 @@ if __name__ == "__main__":
 
         try:
             # 使用简化版本
+            from typing import cast
             (X, Y, numeric_cols_idx, x_col_names, y_col_names,
              observed_combos, observed_value_counts, observed_value_ratios,
-             onehot_groups, oh_index_map) = load_smart_data_simple(
+             onehot_groups, oh_index_map) = cast(tuple, load_smart_data_simple(
                 csv_path=args.csv,
                 element_cols=("Promoter 1", "Promoter 2"),
                 text_cols=("Type of sysnthesis procedure",),
-                element_embedding=args.mode
-            )
+                element_embedding=args.mode,
+                return_dataframe=False
+            ))
 
             print(f"\n数据加载完成:")
             print(f"  X 形状: {X.shape}")
