@@ -16,6 +16,8 @@ data_loader:
   save_conflict_report: false
   conflict_report_prefix: "duplicate_input"
   # conflict_report_dir: "./data"
+  aggregate_duplicate_inputs: true
+  duplicate_target_agg: "median"
   promoter_ratio_cols:
     - "Promoter 1 ratio (Promoter 1:Cu)"
     - "Promoter 2 ratio (Promoter 2:Cu)"
@@ -134,8 +136,8 @@ inference:
 optuna:
   overfit_penalty_alpha: 0.0
   enable: true
-  trials: 800
-  models: ["RF", "CatBoost", "DT", "ANN", "XGB", "SVM"]
+  trials: 1400
+  models: ["CatBoost"]
   slice_params:
     ANN: ["hidden_dims", "learning_rate", "dropout", "weight_decay", "batch_size"]
     RF: ["n_estimators", "max_depth", "ccp_alpha"]

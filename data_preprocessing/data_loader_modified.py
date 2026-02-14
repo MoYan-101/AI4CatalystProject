@@ -116,6 +116,141 @@ def _resolve_promoter_ratio_cols(
     return ratio_map
 
 
+def _is_explicit_null_token(value: Any) -> bool:
+    return isinstance(value, str) and value.strip().lower() == "null"
+
+
+def _stable_seed_from_text(text: str) -> int:
+    return int(sum(ord(ch) for ch in text) % 100000)
+
+
+def _sample_numeric_kde(
+    observed: np.ndarray,
+    n_samples: int,
+    seed: int
+) -> np.ndarray:
+    observed = np.asarray(observed, dtype=np.float32)
+    observed = observed[np.isfinite(observed)]
+    if n_samples <= 0:
+        return np.zeros((0,), dtype=np.float32)
+    if observed.size == 0:
+        return np.zeros((n_samples,), dtype=np.float32)
+    if observed.size < 2:
+        fill_val = float(np.nanmedian(observed))
+        if not np.isfinite(fill_val):
+            fill_val = 0.0
+        return np.full((n_samples,), fill_val, dtype=np.float32)
+
+    try:
+        from scipy.stats import gaussian_kde
+    except Exception:
+        fill_val = float(np.nanmedian(observed))
+        if not np.isfinite(fill_val):
+            fill_val = 0.0
+        return np.full((n_samples,), fill_val, dtype=np.float32)
+
+    try:
+        kde = gaussian_kde(observed)
+        rng = np.random.default_rng(seed)
+        try:
+            samples = kde.resample(n_samples, seed=rng).reshape(-1)
+        except TypeError:
+            state = np.random.get_state()
+            np.random.seed(seed)
+            try:
+                samples = kde.resample(n_samples).reshape(-1)
+            finally:
+                np.random.set_state(state)
+    except Exception:
+        fill_val = float(np.nanmedian(observed))
+        if not np.isfinite(fill_val):
+            fill_val = 0.0
+        samples = np.full((n_samples,), fill_val, dtype=np.float32)
+
+    samples = np.clip(samples, 0.0, 1e9)
+    return np.asarray(samples, dtype=np.float32)
+
+
+def _apply_promoter_ratio_missing_rules(
+    df: pd.DataFrame,
+    element_cols: Sequence[str],
+    ratio_col_map: Dict[str, Optional[str]],
+    impute_seed: int = 42,
+    prefer_kde: bool = True,
+) -> pd.DataFrame:
+    """
+    Ratio rules:
+    1) If promoter is explicit "Null" -> ratio must be 0.
+    2) For non-null promoters with missing ratio -> impute (prefer KDE).
+    """
+    df = df.copy()
+    for idx, pcol in enumerate(element_cols):
+        rcol = ratio_col_map.get(pcol)
+        if not rcol or pcol not in df.columns or rcol not in df.columns:
+            continue
+
+        promoter_series = df[pcol]
+        ratio_series = pd.to_numeric(df[rcol], errors="coerce")
+        null_mask = promoter_series.map(_is_explicit_null_token).fillna(False)
+        ratio_series.loc[null_mask] = 0.0
+
+        missing_non_null = ratio_series.isna() & (~null_mask)
+        if missing_non_null.any():
+            promoter_tokens = promoter_series.map(_clean_material_token)
+            observed_global = ratio_series[(~ratio_series.isna()) & (~null_mask)].to_numpy(dtype=np.float32)
+
+            # Fill per promoter token first, then fallback to global pool.
+            for token in promoter_tokens[missing_non_null].unique():
+                if not token:
+                    continue
+                grp_missing = missing_non_null & promoter_tokens.eq(token)
+                n_grp = int(grp_missing.sum())
+                if n_grp <= 0:
+                    continue
+                grp_obs = ratio_series[
+                    (~ratio_series.isna()) & (~null_mask) & promoter_tokens.eq(token)
+                ].to_numpy(dtype=np.float32)
+                base = grp_obs if grp_obs.size >= 2 else observed_global
+
+                if prefer_kde:
+                    samples = _sample_numeric_kde(
+                        base,
+                        n_grp,
+                        seed=int(impute_seed + idx * 1009 + _stable_seed_from_text(token))
+                    )
+                else:
+                    fill_val = float(np.nanmean(base)) if base.size > 0 else 0.0
+                    if not np.isfinite(fill_val):
+                        fill_val = 0.0
+                    samples = np.full((n_grp,), fill_val, dtype=np.float32)
+                ratio_series.loc[grp_missing] = samples
+
+            remaining = ratio_series.isna() & (~null_mask)
+            if remaining.any():
+                n_rem = int(remaining.sum())
+                if prefer_kde:
+                    samples = _sample_numeric_kde(
+                        observed_global,
+                        n_rem,
+                        seed=int(impute_seed + idx * 2029 + 17)
+                    )
+                else:
+                    fill_val = float(np.nanmean(observed_global)) if observed_global.size > 0 else 0.0
+                    if not np.isfinite(fill_val):
+                        fill_val = 0.0
+                    samples = np.full((n_rem,), fill_val, dtype=np.float32)
+                ratio_series.loc[remaining] = samples
+
+        if ratio_series.isna().any():
+            fallback = float(np.nanmedian(ratio_series.to_numpy(dtype=np.float32)))
+            if not np.isfinite(fallback):
+                fallback = 0.0
+            ratio_series = ratio_series.fillna(fallback)
+
+        df[rcol] = np.clip(ratio_series.to_numpy(dtype=np.float32), 0.0, 1e9)
+    return df
+
+
 def _clean_material_token(value: Any) -> str:
     """Normalize material token used by interaction features."""
     if value is None:
@@ -376,6 +511,87 @@ def save_duplicate_input_conflict_report(
 
     return (conflict_path, aggregated_path, len(conflict_groups),
             sum(len(v) for _, v in conflict_groups))
+
+
+def _aggregate_duplicate_input_rows(
+    df: pd.DataFrame,
+    y_cols: Sequence[str],
+    drop_metadata_cols: Sequence[str] = (),
+    target_agg: str = "median",
+) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    """
+    Aggregate rows with identical inputs (excluding metadata columns).
+    Targets are aggregated by mean/median to reduce label noise.
+    """
+    y_cols = [c for c in y_cols if c in df.columns]
+    if not y_cols:
+        return df, {
+            "original_rows": int(df.shape[0]),
+            "dedup_rows": int(df.shape[0]),
+            "reduced_rows": 0,
+            "duplicate_groups": 0,
+            "conflict_groups": 0,
+            "conflict_rows": 0,
+        }
+
+    agg_mode = str(target_agg).strip().lower()
+    if agg_mode not in {"mean", "median"}:
+        raise ValueError("duplicate target aggregation must be 'mean' or 'median'.")
+
+    drop_set = set(y_cols) | set(drop_metadata_cols)
+    input_cols = [c for c in df.columns if c not in drop_set]
+    if not input_cols:
+        return df, {
+            "original_rows": int(df.shape[0]),
+            "dedup_rows": int(df.shape[0]),
+            "reduced_rows": 0,
+            "duplicate_groups": 0,
+            "conflict_groups": 0,
+            "conflict_rows": 0,
+        }
+
+    rows_out: List[pd.Series] = []
+    duplicate_groups = 0
+    conflict_groups = 0
+    conflict_rows = 0
+
+    for _, grp in df.groupby(input_cols, dropna=False, sort=False):
+        g = grp.copy()
+        n = int(g.shape[0])
+        if n > 1:
+            duplicate_groups += 1
+
+        y_num = g[y_cols].apply(pd.to_numeric, errors="coerce")
+        y_keys = {
+            tuple(None if np.isnan(v) else float(v) for v in row)
+            for row in y_num.to_numpy(dtype=float)
+        }
+        if len(y_keys) > 1:
+            conflict_groups += 1
+            conflict_rows += n
+
+        row = g.iloc[0].copy()
+        for ycol in y_cols:
+            vals = y_num[ycol].to_numpy(dtype=float)
+            vals = vals[np.isfinite(vals)]
+            if vals.size == 0:
+                row[ycol] = np.nan
+            elif agg_mode == "median":
+                row[ycol] = float(np.nanmedian(vals))
+            else:
+                row[ycol] = float(np.nanmean(vals))
+        rows_out.append(row)
+
+    dedup_df = pd.DataFrame(rows_out, columns=df.columns).reset_index(drop=True)
+    stats = {
+        "original_rows": int(df.shape[0]),
+        "dedup_rows": int(dedup_df.shape[0]),
+        "reduced_rows": int(df.shape[0] - dedup_df.shape[0]),
+        "duplicate_groups": int(duplicate_groups),
+        "conflict_groups": int(conflict_groups),
+        "conflict_rows": int(conflict_rows),
+    }
+    return dedup_df, stats
 
 
 def _read_csv_with_missing(csv_path: str, preserve_null: bool = True) -> pd.DataFrame:
@@ -973,6 +1189,8 @@ def load_smart_data_simple(
     preserve_null: bool = True,
     impute_type_substring: str = "Type",
     impute_skip_substring: str = "ame",
+    aggregate_duplicate_inputs: bool = False,
+    duplicate_target_agg: str = "median",
     return_dataframe: bool = False,
 ):
     """
@@ -988,21 +1206,61 @@ def load_smart_data_simple(
     for c in df.columns:
         df[c] = df[c].map(_normalize_missing)
 
-    # KDE 缺失值填补（强制只用 KDE）
-    if impute_missing:
-        df, _ = _impute_missing_values_kde(
+    # 先确定目标列，便于重复输入聚合时聚合Y
+    y_cols = _resolve_y_cols(df, y_cols)
+
+    # 先对重复输入做聚合，降低标签冲突噪声
+    if aggregate_duplicate_inputs:
+        df, dup_stats = _aggregate_duplicate_input_rows(
             df,
-            element_cols=element_cols,
-            text_cols=text_cols,
-            skip_cols=drop_metadata_cols,
-            type_col_substring=impute_type_substring,
-            skip_name_substring=impute_skip_substring,
-            random_seed=impute_seed,
-            missing_text_token=missing_text_token
+            y_cols=y_cols,
+            drop_metadata_cols=drop_metadata_cols,
+            target_agg=duplicate_target_agg,
+        )
+        print(
+            "[INFO] Duplicate-input aggregation: "
+            f"{dup_stats['original_rows']} -> {dup_stats['dedup_rows']} rows "
+            f"(reduced={dup_stats['reduced_rows']}, "
+            f"duplicate_groups={dup_stats['duplicate_groups']}, "
+            f"conflict_groups={dup_stats['conflict_groups']}, "
+            f"conflict_rows={dup_stats['conflict_rows']})"
         )
 
+    element_cols = tuple(c.strip() for c in element_cols)
+    text_cols = tuple(c.strip() for c in text_cols)
+    ratio_col_map = _resolve_promoter_ratio_cols(element_cols, promoter_ratio_cols, df)
+    ratio_cols = tuple(c for c in ratio_col_map.values() if c and c in df.columns)
+    skip_cols = tuple(drop_metadata_cols) + ratio_cols
+
+    # 通用缺失值填补（ratio 列单独按 promoter 规则处理）
+    if impute_missing:
+        if str(impute_method).lower() == "kde":
+            df, _ = _impute_missing_values_kde(
+                df,
+                element_cols=element_cols,
+                text_cols=text_cols,
+                skip_cols=skip_cols,
+                type_col_substring=impute_type_substring,
+                skip_name_substring=impute_skip_substring,
+                random_seed=impute_seed,
+                missing_text_token=missing_text_token
+            )
+        else:
+            df = _impute_missing_values_simple(
+                df,
+                skip_cols=skip_cols,
+                missing_text_token=missing_text_token
+            )
+
+    df = _apply_promoter_ratio_missing_rules(
+        df,
+        element_cols=element_cols,
+        ratio_col_map=ratio_col_map,
+        impute_seed=impute_seed,
+        prefer_kde=True
+    )
+
     # 选择Y列
-    y_cols = _resolve_y_cols(df, y_cols)
     y_col_names = list(y_cols)
 
     # 选择X列
@@ -1039,9 +1297,6 @@ def load_smart_data_simple(
             above100 = int((col > 100).sum())
             if below0 > 0 or above100 > 0:
                 print(f"[WARN] Y-col '{cname}' has {below0} <0, {above100} >100 (after NaN fill)")
-
-    element_cols = tuple(c.strip() for c in element_cols)
-    text_cols = tuple(c.strip() for c in text_cols)
 
     special_cols = set(element_cols) | set(text_cols)
     numeric_cols = [c for c in X_df.columns if c not in special_cols]
@@ -1106,8 +1361,6 @@ def load_smart_data_simple(
         print("\n使用 SimplifiedMaterialFeaturizer...")
     else:
         element_featurizer = MagpieFeaturizer()
-
-    ratio_col_map = _resolve_promoter_ratio_cols(element_cols, promoter_ratio_cols, df)
 
     N = len(X_df)
 
@@ -1342,6 +1595,7 @@ def load_raw_data_for_correlation(
     drop_nan: bool = True,
     fill_same_as_train: bool = True,
     element_cols: tuple[str, ...] = ("Promoter 1", "Promoter 2"),
+    promoter_ratio_cols: Optional[Sequence[str]] = None,
     text_cols: Tuple[str, ...] = ("Type of sysnthesis procedure",),
     drop_metadata_cols: Tuple[str, ...] = ("DOI", "Name", "Year"),
     impute_seed: int = 42,
@@ -1349,6 +1603,8 @@ def load_raw_data_for_correlation(
     impute_skip_substring: str = "ame",
     missing_text_token: str = "__MISSING__",
     impute_method: str = "simple",
+    aggregate_duplicate_inputs: bool = False,
+    duplicate_target_agg: str = "median",
     preserve_null: bool = True,
 ) -> pd.DataFrame:
     """
@@ -1362,13 +1618,28 @@ def load_raw_data_for_correlation(
     for c in df.columns:
         df[c] = df[c].map(_normalize_missing)
 
+    y_cols = _resolve_y_cols(df, None)
+    if aggregate_duplicate_inputs:
+        df, _ = _aggregate_duplicate_input_rows(
+            df,
+            y_cols=y_cols,
+            drop_metadata_cols=drop_metadata_cols,
+            target_agg=duplicate_target_agg,
+        )
+
+    element_cols = tuple(c.strip() for c in element_cols)
+    text_cols = tuple(c.strip() for c in text_cols)
+    ratio_col_map = _resolve_promoter_ratio_cols(element_cols, promoter_ratio_cols, df)
+    ratio_cols = tuple(c for c in ratio_col_map.values() if c and c in df.columns)
+    skip_cols = tuple(drop_metadata_cols) + ratio_cols
+
     if fill_same_as_train:
         if str(impute_method).lower() == "kde":
             df, _ = _impute_missing_values_kde(
                 df,
                 element_cols=element_cols,
                 text_cols=text_cols,
-                skip_cols=drop_metadata_cols,
+                skip_cols=skip_cols,
                 type_col_substring=impute_type_substring,
                 skip_name_substring=impute_skip_substring,
                 random_seed=impute_seed,
@@ -1377,9 +1648,17 @@ def load_raw_data_for_correlation(
         else:
             df = _impute_missing_values_simple(
                 df,
-                skip_cols=drop_metadata_cols,
+                skip_cols=skip_cols,
                 missing_text_token=missing_text_token
             )
+
+    df = _apply_promoter_ratio_missing_rules(
+        df,
+        element_cols=element_cols,
+        ratio_col_map=ratio_col_map,
+        impute_seed=impute_seed,
+        prefer_kde=True
+    )
 
     if input_len is not None and output_len is not None:
         check_len = input_len + output_len

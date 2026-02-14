@@ -639,6 +639,8 @@ def train_main():
         preserve_null=preserve_null,
         impute_type_substring=impute_type_substring,
         impute_skip_substring=impute_skip_substring,
+        aggregate_duplicate_inputs=dl_cfg.get("aggregate_duplicate_inputs", False),
+        duplicate_target_agg=dl_cfg.get("duplicate_target_agg", "median"),
         return_dataframe=False
     ))
 
@@ -684,6 +686,7 @@ def train_main():
         output_len=out_len,
         fill_same_as_train=True,
         element_cols=element_cols,
+        promoter_ratio_cols=dl_cfg.get("promoter_ratio_cols", None),
         text_cols=text_cols,
         drop_metadata_cols=drop_metadata_cols,
         impute_seed=impute_seed,
@@ -691,6 +694,8 @@ def train_main():
         impute_skip_substring=impute_skip_substring,
         missing_text_token=missing_text_token,
         impute_method=impute_method,
+        aggregate_duplicate_inputs=dl_cfg.get("aggregate_duplicate_inputs", False),
+        duplicate_target_agg=dl_cfg.get("duplicate_target_agg", "median"),
         preserve_null=preserve_null
     )
     raw_csv_path = os.path.join(base_outdir, "df_raw_14.csv")
@@ -744,7 +749,9 @@ def train_main():
         "impute_seed": impute_seed,
         "preserve_null": preserve_null,
         "impute_type_substring": impute_type_substring,
-        "impute_skip_substring": impute_skip_substring
+        "impute_skip_substring": impute_skip_substring,
+        "aggregate_duplicate_inputs": dl_cfg.get("aggregate_duplicate_inputs", False),
+        "duplicate_target_agg": dl_cfg.get("duplicate_target_agg", "median")
     }
 
     meta_path = os.path.join(root_model_dir, "metadata.pkl")
