@@ -1668,11 +1668,11 @@ def plot_cv_boxplot(
 
         ax2.plot([i * group_gap for i in range(n_models)],
                  mean_ovf, marker="^", markersize=8,
-                 linewidth=2, color="purple", label="Over‑fit")
+                 linewidth=2, color="purple", label="Over-fit")
 
         # y‑label
-        label_text = "MSE ratio (Val/Train)" if metric == "MSE" \
-                     else "R$^2$ diff (Train−Val)"
+        label_text = "MSE ratio (Val/Train)" if metric == "MSE" \
+                     else "R$^2$ diff (Train - Val)"
         ax2.set_ylabel(label_text)
 
         # ➜ 同样只保留 1 位小数
@@ -1761,7 +1761,7 @@ def plot_overfitting_horizontal(overfit_data,
             ax.axvline(threshold_h, color=GRAY, ls="--", lw=1.8)
             zones = [
                 Patch(facecolor=GRAY, alpha=0.2, label="Acceptable"),
-                Patch(facecolor=LIGHT_RED, alpha=0.3, label="Overfitting Risk")
+                Patch(facecolor=LIGHT_RED, alpha=0.3, label="Overfitting Risk")
             ]
 
         # -------- 坐标范围与刻度 --------
@@ -1781,12 +1781,12 @@ def plot_overfitting_horizontal(overfit_data,
 
     # 左：MSE Ratio
     lollipop(axes[0], model_names, msr_vals,
-             "MSE Ratio (Val / Train)",
+             "MSE Ratio (Val / Train)",
              threshold_h=10, threshold_l=5)
 
     # 右：R² diff
     lollipop(axes[1], model_names, r2d_vals,
-             "R$^2$ difference (Train − Val)",
+             "R$^2$ difference (Train - Val)",
              threshold_h=0.20, threshold_l=0.15)
 
     plt.tight_layout()

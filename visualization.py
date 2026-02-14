@@ -597,8 +597,8 @@ def visualize_main():
     heatmap_y_label = axes_names[1] if len(axes_names) >= 2 else "Y-axis"
     heatmap_z_label = axes_names[2] if len(axes_names) >= 3 else "Z-axis"
 
-    confusion_row_axis = config["inference"]["confusion_axes"]["row_name"]
-    confusion_col_axis = config["inference"]["confusion_axes"]["col_name"]
+    conf_default = config["inference"]["confusion_axes"]
+    conf_by_model = config["inference"].get("confusion_axes_by_model", {})
     # —— 每个模型的 2-D 组合重新从 0 编号 ——
 
     for mtype in inf_models:
@@ -731,8 +731,9 @@ def visualize_main():
 
             if len(oh_groups) >= 2:  # ←—— 这里保留 !
                 # ② 根据 config 关键字，确定行 / 列用哪两个组
-                row_kw = config["inference"]["confusion_axes"]["row_name"]
-                col_kw = config["inference"]["confusion_axes"]["col_name"]
+                conf_m = conf_by_model.get(mtype, {})
+                row_kw = conf_m.get("row_name", conf_default["row_name"])
+                col_kw = conf_m.get("col_name", conf_default["col_name"])
 
                 row_idx = _find_group_idx_by_name(row_kw, group_names) if group_names else None
                 col_idx = _find_group_idx_by_name(col_kw, group_names) if group_names else None

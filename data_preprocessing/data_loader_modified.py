@@ -116,6 +116,160 @@ def _resolve_promoter_ratio_cols(
     return ratio_map
 
 
+def _clean_material_token(value: Any) -> str:
+    """Normalize material token used by interaction features."""
+    if value is None:
+        return ""
+    if isinstance(value, float) and np.isnan(value):
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    if text.lower() in {"none", "nan"}:
+        return ""
+    return text
+
+
+def _build_promoter_pair_interaction_block(
+    left_col: str,
+    right_col: str,
+    left_tokens: np.ndarray,
+    right_tokens: np.ndarray,
+    left_ratio: np.ndarray,
+    right_ratio: np.ndarray,
+    left_base_vec: np.ndarray,
+    right_base_vec: np.ndarray,
+    left_is_null: np.ndarray,
+    right_is_null: np.ndarray,
+    eps: float = 1e-8,
+    add_pair_onehot: bool = True,
+    pair_onehot_min_count: int = 2,
+    pair_onehot_max_categories: int = 64,
+) -> Tuple[np.ndarray, List[str]]:
+    """
+    Build cross features to bind promoter1/promoter2 identity and ratio.
+    """
+    if left_ratio.shape != right_ratio.shape:
+        raise ValueError("Left/right ratio vectors must have the same shape.")
+    if left_base_vec.shape != right_base_vec.shape:
+        raise ValueError("Left/right base vectors must have the same shape.")
+
+    N = left_ratio.shape[0]
+    if N == 0:
+        return np.zeros((0, 0), dtype=np.float32), []
+
+    eps = float(eps) if eps is not None else 1e-8
+    if eps <= 0:
+        eps = 1e-8
+
+    ratio_sum = left_ratio + right_ratio
+    ratio_diff = left_ratio - right_ratio
+    ratio_abs_diff = np.abs(ratio_diff)
+    ratio_prod = left_ratio * right_ratio
+    ratio_share_left = left_ratio / (ratio_sum + eps)
+    ratio_share_right = right_ratio / (ratio_sum + eps)
+    ratio_min = np.minimum(left_ratio, right_ratio)
+    ratio_max = np.maximum(left_ratio, right_ratio)
+    ratio_balance = ratio_min / (ratio_max + eps)
+
+    dot = np.sum(left_base_vec * right_base_vec, axis=1)
+    norm_left = np.linalg.norm(left_base_vec, axis=1)
+    norm_right = np.linalg.norm(right_base_vec, axis=1)
+    cosine = dot / (norm_left * norm_right + eps)
+    l2_dist = np.linalg.norm(left_base_vec - right_base_vec, axis=1)
+    weighted_dot = dot * ratio_prod
+
+    same_material = (
+        (left_tokens == right_tokens) & (left_tokens != "") & (right_tokens != "")
+    ).astype(np.float32)
+    any_null = ((left_is_null > 0.5) | (right_is_null > 0.5)).astype(np.float32)
+    both_null = ((left_is_null > 0.5) & (right_is_null > 0.5)).astype(np.float32)
+    both_non_null = ((left_is_null < 0.5) & (right_is_null < 0.5)).astype(np.float32)
+
+    pair_prefix = f"{left_col}__x__{right_col}"
+    dense_block = np.column_stack(
+        [
+            ratio_sum,
+            ratio_diff,
+            ratio_abs_diff,
+            ratio_prod,
+            ratio_share_left,
+            ratio_share_right,
+            ratio_min,
+            ratio_max,
+            ratio_balance,
+            dot,
+            cosine,
+            l2_dist,
+            weighted_dot,
+            same_material,
+            any_null,
+            both_null,
+            both_non_null,
+        ]
+    ).astype(np.float32)
+    dense_labels = [
+        f"{pair_prefix}__ratio_sum",
+        f"{pair_prefix}__ratio_diff",
+        f"{pair_prefix}__ratio_abs_diff",
+        f"{pair_prefix}__ratio_prod",
+        f"{pair_prefix}__ratio_share_left",
+        f"{pair_prefix}__ratio_share_right",
+        f"{pair_prefix}__ratio_min",
+        f"{pair_prefix}__ratio_max",
+        f"{pair_prefix}__ratio_balance",
+        f"{pair_prefix}__embed_dot",
+        f"{pair_prefix}__embed_cosine",
+        f"{pair_prefix}__embed_l2",
+        f"{pair_prefix}__embed_weighted_dot",
+        f"{pair_prefix}__same_material",
+        f"{pair_prefix}__any_null",
+        f"{pair_prefix}__both_null",
+        f"{pair_prefix}__both_non_null",
+    ]
+
+    if not add_pair_onehot:
+        return dense_block, dense_labels
+
+    min_count = max(int(pair_onehot_min_count), 1)
+    max_categories = int(pair_onehot_max_categories)
+    left_safe = np.where(left_tokens == "", "__MISSING__", left_tokens)
+    right_safe = np.where(right_tokens == "", "__MISSING__", right_tokens)
+    pair_tokens = np.array(
+        [f"{a}__PAIR__{b}" for a, b in zip(left_safe, right_safe)],
+        dtype=object
+    )
+    pair_counts = Counter(cast(List[str], pair_tokens.tolist()))
+    if not pair_counts:
+        return dense_block, dense_labels
+
+    kept = [tok for tok, cnt in pair_counts.items() if cnt >= min_count]
+    kept.sort(key=lambda t: (-pair_counts[t], t))
+    if max_categories > 0 and len(kept) > max_categories:
+        kept = kept[:max_categories]
+    if not kept:
+        kept = [max(pair_counts.items(), key=lambda kv: kv[1])[0]]
+
+    use_other = len(kept) < len(pair_counts)
+    labels = list(kept)
+    if use_other:
+        labels.append("__OTHER__")
+
+    idx_map = {tok: i for i, tok in enumerate(labels)}
+    onehot = np.zeros((N, len(labels)), dtype=np.float32)
+    other_idx = idx_map.get("__OTHER__")
+    for i, tok in enumerate(cast(List[str], pair_tokens.tolist())):
+        j = idx_map.get(tok)
+        if j is None:
+            if other_idx is None:
+                continue
+            j = other_idx
+        onehot[i, j] = 1.0
+
+    onehot_labels = [f"{pair_prefix}__pair__{tok}" for tok in labels]
+    return np.concatenate([dense_block, onehot], axis=1), dense_labels + onehot_labels
+
+
 def save_duplicate_input_conflict_report(
     csv_path: str,
     y_cols: Optional[Sequence[str]] = None,
@@ -800,6 +954,11 @@ def load_smart_data_simple(
     y_cols: Optional[Sequence[str]] = None,
     promoter_ratio_cols: Optional[Sequence[str]] = None,
     promoter_onehot: bool = True,
+    promoter_interaction_features: bool = True,
+    promoter_pair_onehot: bool = True,
+    promoter_pair_onehot_min_count: int = 2,
+    promoter_pair_onehot_max_categories: int = 64,
+    promoter_interaction_eps: float = 1e-8,
     log_transform_cols: Optional[Sequence[str]] = None,
     log_transform_eps: float = 1e-8,
     # 特征器配置
@@ -817,7 +976,9 @@ def load_smart_data_simple(
     return_dataframe: bool = False,
 ):
     """
-    简化的智能数据加载器 - 支持 Promoter 向量 + ratio 加权 + Null 指示
+    简化的智能数据加载器：
+    - Promoter 向量 + ratio 加权 + Null 指示
+    - 可选 Promoter1/Promoter2 交互特征（ratio 与类别绑定）
     """
     df = _read_csv_with_missing(csv_path, preserve_null=preserve_null)
     df = _strip_colnames(df)
@@ -969,6 +1130,10 @@ def load_smart_data_simple(
     observed_value_ratios: Dict[str, Dict[str, float]] = {}
     onehot_groups: List[List[int]] = []
     oh_index_map: List[int] = [-1] * cur_idx
+    material_tokens_by_col: Dict[str, np.ndarray] = {}
+    base_vecs_by_col: Dict[str, np.ndarray] = {}
+    ratio_by_col: Dict[str, np.ndarray] = {}
+    null_by_col: Dict[str, np.ndarray] = {}
 
     # 元素/材料特征
     for c in element_cols:
@@ -994,19 +1159,28 @@ def load_smart_data_simple(
 
         # 特征化所有材料
         vecs_list = []
+        base_vecs_list = []
+        material_tokens = []
+        ratio_effective = []
+        null_flags = []
         ratio_sum = defaultdict(float)
         ratio_cnt = defaultdict(int)
         ratio_global_sum = 0.0
         ratio_global_cnt = 0
         for mat, ratio_val in zip(materials, ratio_series):
             vec = element_featurizer.featurize(mat)
+            base_vecs_list.append(vec)
             mat_str = ""
             if mat is not None and not (isinstance(mat, float) and np.isnan(mat)):
                 mat_str = str(mat).strip()
+            mat_token = _clean_material_token(mat_str)
             is_null = 1.0 if (isinstance(mat, str) and mat.strip().lower() == "null") else 0.0
             r = float(ratio_val) if ratio_val is not None else 0.0
             if is_null:
                 r = 0.0
+            material_tokens.append(mat_token)
+            ratio_effective.append(r)
+            null_flags.append(is_null)
             # Feature = [base magpie | ratio-weighted magpie | is_null | optional one-hot]
             weighted = vec * r
             oh = np.array([], dtype=np.float32)
@@ -1026,6 +1200,10 @@ def load_smart_data_simple(
                 ratio_global_cnt += 1
 
         vecs = np.vstack(vecs_list)
+        material_tokens_by_col[c] = np.asarray(material_tokens, dtype=object)
+        base_vecs_by_col[c] = np.vstack(base_vecs_list).astype(np.float32)
+        ratio_by_col[c] = np.asarray(ratio_effective, dtype=np.float32)
+        null_by_col[c] = np.asarray(null_flags, dtype=np.float32)
         start, end = cur_idx, cur_idx + vecs.shape[1]
         X_parts.append(vecs)
 
@@ -1053,6 +1231,53 @@ def load_smart_data_simple(
         ratio_map["__GLOBAL__"] = (ratio_global_sum / ratio_global_cnt) if ratio_global_cnt > 0 else 0.0
         observed_value_ratios[c] = ratio_map
         cur_idx = end
+
+    # Promoter 间交互特征（绑定 promoter1/promoter2 的类别与 ratio）
+    if promoter_interaction_features and len(element_cols) >= 2:
+        try:
+            inter_eps = float(promoter_interaction_eps)
+        except (TypeError, ValueError):
+            inter_eps = 1e-8
+            print(f"[WARN] promoter_interaction_eps='{promoter_interaction_eps}' invalid; fallback to {inter_eps}.")
+        if inter_eps <= 0:
+            inter_eps = 1e-8
+
+        for i in range(len(element_cols)):
+            for j in range(i + 1, len(element_cols)):
+                c_left = element_cols[i]
+                c_right = element_cols[j]
+                if (
+                    c_left not in material_tokens_by_col
+                    or c_right not in material_tokens_by_col
+                    or c_left not in base_vecs_by_col
+                    or c_right not in base_vecs_by_col
+                ):
+                    continue
+
+                inter_vecs, inter_labels = _build_promoter_pair_interaction_block(
+                    left_col=c_left,
+                    right_col=c_right,
+                    left_tokens=material_tokens_by_col[c_left],
+                    right_tokens=material_tokens_by_col[c_right],
+                    left_ratio=ratio_by_col[c_left],
+                    right_ratio=ratio_by_col[c_right],
+                    left_base_vec=base_vecs_by_col[c_left],
+                    right_base_vec=base_vecs_by_col[c_right],
+                    left_is_null=null_by_col[c_left],
+                    right_is_null=null_by_col[c_right],
+                    eps=inter_eps,
+                    add_pair_onehot=promoter_pair_onehot,
+                    pair_onehot_min_count=promoter_pair_onehot_min_count,
+                    pair_onehot_max_categories=promoter_pair_onehot_max_categories,
+                )
+                if inter_vecs.size == 0:
+                    continue
+                start, end = cur_idx, cur_idx + inter_vecs.shape[1]
+                X_parts.append(inter_vecs)
+                x_col_names.extend(inter_labels)
+                numeric_cols_idx.extend(list(range(start, end)))
+                oh_index_map.extend([-1] * (end - start))
+                cur_idx = end
 
     # 打印智能特征器统计
     if hasattr(element_featurizer, "print_stats"):

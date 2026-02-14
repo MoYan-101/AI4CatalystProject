@@ -89,6 +89,47 @@ def _to_2d(arr: np.ndarray) -> np.ndarray:
     """把 (n,) 向量统一 reshape 成 (n,1)。已是 2-D 的直接返回。"""
     return arr.reshape(-1, 1) if arr.ndim == 1 else arr
 
+def _resolve_scale_cols_idx(config, model_type, numeric_cols_idx, n_features):
+    """
+    选择输入标准化的列：
+    - 若配置了 preprocessing.standardize_all_features_for，则仅对该列表中的模型
+      做“全特征缩放”（含 one-hot/embedding），其余仅缩放数值列。
+    - 否则回退到 preprocessing.standardize_all_features 的全局开关。
+    """
+    pre_cfg = config.get("preprocessing", {})
+    models_all = pre_cfg.get("standardize_all_features_for", None)
+    if models_all is not None:
+        use_all = model_type in set(models_all)
+    else:
+        use_all = pre_cfg.get("standardize_all_features", False)
+    return list(range(n_features)) if use_all else numeric_cols_idx
+
+def _apply_log_transform(X, x_col_names, cols, eps, numeric_cols_idx=None, tag=None):
+    """
+    在现有特征矩阵上对指定列做 ln 变换（仅数值列）。
+    返回新的 X（不改原数组）。
+    """
+    if not cols:
+        return X
+    eps = float(eps) if eps is not None else 1e-8
+    X_new = X.copy()
+    idx_map = {name: i for i, name in enumerate(x_col_names)}
+    numeric_set = set(numeric_cols_idx or [])
+    for c in cols:
+        if c not in idx_map:
+            print(f"[WARN] log_transform col '{c}' not found in features; skip.")
+            continue
+        idx = idx_map[c]
+        if numeric_set and idx not in numeric_set:
+            print(f"[WARN] log_transform col '{c}' not numeric; skip.")
+            continue
+        col = X_new[:, idx].astype(float)
+        if np.any(col <= 0):
+            print(f"[WARN] log_transform '{c}' has non-positive values; clamping to {eps}."
+                  f"{' (' + str(tag) + ')' if tag else ''}")
+        X_new[:, idx] = np.log(np.clip(col, eps, None))
+    return X_new
+
 # -----------------------------------------------------------------------
 # main tuner
 # -----------------------------------------------------------------------
@@ -97,8 +138,7 @@ def tune_model(model_type, config, X, Y,
                random_seed):
 
     # 1) split & standardize --------------------------------------------------
-    scale_all = config.get("preprocessing", {}).get("standardize_all_features", False)
-    scale_cols_idx = list(range(X.shape[1])) if scale_all else numeric_cols_idx
+    scale_cols_idx = _resolve_scale_cols_idx(config, model_type, numeric_cols_idx, X.shape[1])
     X_train, X_val, Y_train, Y_val = split_data(
         X, Y, test_size=config["data"]["test_size"], random_state=random_seed
     )
@@ -202,6 +242,15 @@ def tune_model(model_type, config, X, Y,
             lr_lo,lr_hi = _safe_float_range(base,"learning_rate_min","learning_rate_max")
             dep_lo,dep_hi = _safe_int_range(base,"depth_min","depth_max")
             l2_lo,l2_hi = _safe_float_range(base,"l2_leaf_reg_min","l2_leaf_reg_max")
+            rs_lo, rs_hi = _safe_float_range(
+                base, "random_strength_min", "random_strength_max"
+            ) if "random_strength_min" in base and "random_strength_max" in base else (1e-8, 1.0)
+            bt_lo, bt_hi = _safe_float_range(
+                base, "bagging_temperature_min", "bagging_temperature_max"
+            ) if "bagging_temperature_min" in base and "bagging_temperature_max" in base else (0.0, 1.0)
+            rsm_lo, rsm_hi = _safe_float_range(
+                base, "rsm_min", "rsm_max"
+            ) if "rsm_min" in base and "rsm_max" in base else (0.6, 1.0)
             es_rounds = config["model"]["catboost_params"].get("early_stopping_rounds", 50)
 
             model_instance = CatBoostRegression(
@@ -209,6 +258,9 @@ def tune_model(model_type, config, X, Y,
                 learning_rate= trial.suggest_float("learning_rate", lr_lo, lr_hi, log=True),
                 depth        = trial.suggest_int  ("depth",        dep_lo, dep_hi),
                 l2_leaf_reg  = trial.suggest_float("l2_leaf_reg",  l2_lo, l2_hi, log=True),
+                random_strength = trial.suggest_float("random_strength", rs_lo, rs_hi, log=True),
+                bagging_temperature = trial.suggest_float("bagging_temperature", bt_lo, bt_hi),
+                rsm = trial.suggest_float("rsm", rsm_lo, rsm_hi),
                 random_seed  = config["model"]["catboost_params"]["random_seed"]
             )
             model_instance.fit(X_train_s, Y_train_s,
@@ -225,6 +277,18 @@ def tune_model(model_type, config, X, Y,
             d_lo,d_hi   = _safe_int_range  (base,"max_depth_min","max_depth_max")
             a_lo,a_hi   = _safe_float_range(base,"reg_alpha_min","reg_alpha_max")
             l_lo,l_hi   = _safe_float_range(base,"reg_lambda_min","reg_lambda_max")
+            mcw_lo, mcw_hi = _safe_float_range(
+                base, "min_child_weight_min", "min_child_weight_max"
+            ) if "min_child_weight_min" in base and "min_child_weight_max" in base else (1.0, 10.0)
+            gm_lo, gm_hi = _safe_float_range(
+                base, "gamma_min", "gamma_max"
+            ) if "gamma_min" in base and "gamma_max" in base else (1e-8, 1.0)
+            ss_lo, ss_hi = _safe_float_range(
+                base, "subsample_min", "subsample_max"
+            ) if "subsample_min" in base and "subsample_max" in base else (0.6, 1.0)
+            cs_lo, cs_hi = _safe_float_range(
+                base, "colsample_bytree_min", "colsample_bytree_max"
+            ) if "colsample_bytree_min" in base and "colsample_bytree_max" in base else (0.6, 1.0)
             es_rounds = config["model"]["xgb_params"].get("early_stopping_rounds", 50)
 
             model_instance = XGBRegression(
@@ -233,6 +297,10 @@ def tune_model(model_type, config, X, Y,
                 max_depth    = trial.suggest_int  ("max_depth", d_lo, d_hi),
                 reg_alpha    = trial.suggest_float("reg_alpha", a_lo, a_hi, log=True),
                 reg_lambda   = trial.suggest_float("reg_lambda", l_lo, l_hi, log=True),
+                min_child_weight = _suggest_float_auto(trial, "min_child_weight", mcw_lo, mcw_hi),
+                gamma        = trial.suggest_float("gamma", gm_lo, gm_hi, log=True),
+                subsample    = trial.suggest_float("subsample", ss_lo, ss_hi),
+                colsample_bytree = trial.suggest_float("colsample_bytree", cs_lo, cs_hi),
                 random_state = config["model"]["xgb_params"]["random_seed"]
             )
             model_instance = train_sklearn_model(model_instance, X_train_s, Y_train_s,
@@ -245,6 +313,7 @@ def tune_model(model_type, config, X, Y,
             c_lo, c_hi = _safe_float_range(base, "C_min", "C_max")
             e_lo, e_hi = _safe_float_range(base, "epsilon_min", "epsilon_max")
             g_lo, g_hi = _safe_float_range(base, "gamma_min", "gamma_max")
+            max_iter = int(base.get("max_iter", 20000))
             k_choices = base.get("kernel_choices", None)
             if k_choices is None:
                 k_cfg = base.get("kernel", "rbf")
@@ -260,8 +329,9 @@ def tune_model(model_type, config, X, Y,
             coef0 = None
             if kernel == "poly":
                 d_lo, d_hi = _safe_int_range(base, "degree_min", "degree_max")
-                c0_lo, c0_hi = _safe_float_range(base, "coef0_min", "coef0_max")
                 degree = trial.suggest_int("degree", d_lo, d_hi)
+            if kernel in ["poly", "sigmoid"]:
+                c0_lo, c0_hi = _safe_float_range(base, "coef0_min", "coef0_max")
                 coef0 = _suggest_float_auto(trial, "coef0", c0_lo, c0_hi)
 
             model_instance = SVMRegression(
@@ -270,7 +340,8 @@ def tune_model(model_type, config, X, Y,
                 epsilon=_suggest_float_auto(trial, "epsilon", e_lo, e_hi),
                 gamma=gamma,
                 degree=degree if degree is not None else 3,
-                coef0=coef0 if coef0 is not None else 0.0
+                coef0=coef0 if coef0 is not None else 0.0,
+                max_iter=max_iter
             )
             model_instance = train_sklearn_model(model_instance, X_train_s, Y_train_s)
             pred_train, pred_val = model_instance.predict(X_train_s), model_instance.predict(X_val_s)
@@ -401,6 +472,9 @@ def create_model_by_type(model_type, config, random_seed=42, input_dim=None):
         cat_cfg.setdefault("depth", 8)
         cat_cfg.setdefault("random_seed", random_seed)
         cat_cfg.setdefault("l2_leaf_reg", 3.0)
+        cat_cfg.setdefault("random_strength", 1.0)
+        cat_cfg.setdefault("bagging_temperature", 0.0)
+        cat_cfg.setdefault("rsm", 1.0)
         cat_cfg.setdefault("thread_count", -1)
         return CatBoostRegression(
             iterations=cat_cfg["iterations"],
@@ -408,6 +482,9 @@ def create_model_by_type(model_type, config, random_seed=42, input_dim=None):
             depth=cat_cfg["depth"],
             random_seed=cat_cfg["random_seed"],
             l2_leaf_reg=cat_cfg.get("l2_leaf_reg", 3.0),
+            random_strength=cat_cfg.get("random_strength", 1.0),
+            bagging_temperature=cat_cfg.get("bagging_temperature", 0.0),
+            rsm=cat_cfg.get("rsm", 1.0),
             thread_count=cat_cfg.get("thread_count", -1)
         )
     elif model_type == "XGB":
@@ -420,6 +497,10 @@ def create_model_by_type(model_type, config, random_seed=42, input_dim=None):
         xgb_cfg.setdefault("random_seed", random_seed)
         xgb_cfg.setdefault("reg_alpha", 0.0)
         xgb_cfg.setdefault("reg_lambda", 1.0)
+        xgb_cfg.setdefault("min_child_weight", 1.0)
+        xgb_cfg.setdefault("gamma", 0.0)
+        xgb_cfg.setdefault("subsample", 1.0)
+        xgb_cfg.setdefault("colsample_bytree", 1.0)
         xgb_cfg.setdefault("n_jobs", -1)
         return XGBRegression(
             n_estimators=xgb_cfg["n_estimators"],
@@ -428,6 +509,10 @@ def create_model_by_type(model_type, config, random_seed=42, input_dim=None):
             random_state=xgb_cfg["random_seed"],
             reg_alpha=xgb_cfg.get("reg_alpha", 0.0),
             reg_lambda=xgb_cfg.get("reg_lambda", 1.0),
+            min_child_weight=xgb_cfg.get("min_child_weight", 1.0),
+            gamma=xgb_cfg.get("gamma", 0.0),
+            subsample=xgb_cfg.get("subsample", 1.0),
+            colsample_bytree=xgb_cfg.get("colsample_bytree", 1.0),
             n_jobs=xgb_cfg.get("n_jobs", -1)
         )
     elif model_type == "SVM":
@@ -440,13 +525,15 @@ def create_model_by_type(model_type, config, random_seed=42, input_dim=None):
         svm_cfg.setdefault("gamma", "scale")
         svm_cfg.setdefault("degree", 3)
         svm_cfg.setdefault("coef0", 0.0)
+        svm_cfg.setdefault("max_iter", 20000)
         return SVMRegression(
             kernel=svm_cfg["kernel"],
             C=svm_cfg["C"],
             epsilon=svm_cfg["epsilon"],
             gamma=svm_cfg["gamma"],
             degree=svm_cfg["degree"],
-            coef0=svm_cfg["coef0"]
+            coef0=svm_cfg["coef0"],
+            max_iter=svm_cfg["max_iter"]
         )
     else:
         raise ValueError(f"Unknown model type: {model_type}")
@@ -479,6 +566,16 @@ def train_main():
 
     base_outdir = get_postprocess_dir(csv_name, run_id, "train")
     ensure_dir(base_outdir)
+    # 保存当前配置快照（便于对比）
+    eval_dir = get_eval_dir(csv_name, run_id)
+    ensure_dir(eval_dir)
+    config_snapshot_path = os.path.join(eval_dir, "config_snapshot.yaml")
+    try:
+        with open(config_snapshot_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(config, f, sort_keys=False, allow_unicode=True)
+        print(f"[INFO] Config snapshot saved => {config_snapshot_path}")
+    except Exception as e:
+        print(f"[WARN] Failed to save config snapshot: {e}")
 
     # 1) 加载数据（智能特征器）
     dl_cfg = config.get("data_loader", {})
@@ -496,6 +593,7 @@ def train_main():
     impute_type_substring = dl_cfg.get("impute_type_substring", "Type")
     impute_skip_substring = dl_cfg.get("impute_skip_substring", "ame")
     log_transform_cols = dl_cfg.get("log_transform_cols", None)
+    log_transform_cols_extra_for = dl_cfg.get("log_transform_cols_extra_for", {}) or {}
     log_transform_eps = dl_cfg.get("log_transform_eps", 1e-8)
     save_conflict_report = dl_cfg.get("save_conflict_report", False)
     conflict_report_prefix = dl_cfg.get("conflict_report_prefix", "duplicate_input")
@@ -524,6 +622,11 @@ def train_main():
         y_cols=y_cols,
         promoter_ratio_cols=dl_cfg.get("promoter_ratio_cols", None),
         promoter_onehot=dl_cfg.get("promoter_onehot", True),
+        promoter_interaction_features=dl_cfg.get("promoter_interaction_features", True),
+        promoter_pair_onehot=dl_cfg.get("promoter_pair_onehot", True),
+        promoter_pair_onehot_min_count=dl_cfg.get("promoter_pair_onehot_min_count", 2),
+        promoter_pair_onehot_max_categories=dl_cfg.get("promoter_pair_onehot_max_categories", 64),
+        promoter_interaction_eps=dl_cfg.get("promoter_interaction_eps", 1e-8),
         log_transform_cols=log_transform_cols,
         log_transform_eps=log_transform_eps,
         element_embedding=element_embedding,
@@ -539,11 +642,36 @@ def train_main():
         return_dataframe=False
     ))
 
+    # 基础特征矩阵（已包含 base log 变换）
+    X_base = X
+
+    # 额外 log 变换（仅对指定模型叠加）
+    model_types = config.get("model", {}).get("types", [])
+    log_base = list(log_transform_cols or [])
+    extra_cols_by_model = {}
+    X_by_model = {m: X_base for m in model_types}
+    for m in model_types:
+        extra_cols = list(log_transform_cols_extra_for.get(m, []) or [])
+        extra_cols = [c for c in extra_cols if c not in log_base]
+        if extra_cols:
+            X_by_model[m] = _apply_log_transform(
+                X_base, x_col_names, extra_cols, log_transform_eps,
+                numeric_cols_idx=numeric_cols_idx, tag=m
+            )
+            extra_cols_by_model[m] = extra_cols
+
+    scale_cols_all = list(range(X_base.shape[1]))
+    scale_cols_numeric = numeric_cols_idx
+    scale_cols_idx_by_model = {
+        m: _resolve_scale_cols_idx(config, m, numeric_cols_idx, X_base.shape[1])
+        for m in model_types
+    }
+    # legacy default (kept for backward compatibility)
     scale_all_features = config.get("preprocessing", {}).get("standardize_all_features", False)
-    scale_cols_idx = list(range(X.shape[1])) if scale_all_features else numeric_cols_idx
+    scale_cols_idx = list(range(X_base.shape[1])) if scale_all_features else numeric_cols_idx
 
     # 1.1) 保存特征矩阵与列名
-    np.save(os.path.join(base_outdir, "X_features.npy"), X)
+    np.save(os.path.join(base_outdir, "X_features.npy"), X_base)
     np.save(os.path.join(base_outdir, "x_feature_colnames.npy"), x_col_names)
 
     # 1.2) 若要做 raw correlation
@@ -570,9 +698,10 @@ def train_main():
     print(f"[INFO] Saved raw 14-col CSV => {raw_csv_path}")
 
     # 2) 提取统计信息 => metadata.pkl
-    stats_dict = extract_data_statistics(X, x_col_names, numeric_cols_idx, Y=Y, y_col_names=y_col_names)
+    stats_dict = extract_data_statistics(X_base, x_col_names, numeric_cols_idx, Y=Y, y_col_names=y_col_names)
     stats_dict["numeric_cols_idx"] = numeric_cols_idx  # ← 这行新增
     stats_dict["scale_cols_idx"] = scale_cols_idx
+    stats_dict["scale_cols_idx_by_model"] = scale_cols_idx_by_model
     stats_dict["onehot_groups"] = onehot_groups
     stats_dict["oh_index_map"] = feature_group_map
     stats_dict["observed_onehot_combos"] = observed_values
@@ -589,7 +718,7 @@ def train_main():
         element_embedding=element_embedding,
         promoter_onehot=dl_cfg.get("promoter_onehot", True)
     )
-    stats_dict["feature_means"] = X.mean(axis=0)
+    stats_dict["feature_means"] = X_base.mean(axis=0)
     stats_dict["x_col_names"] = x_col_names
     stats_dict["y_col_names"] = y_col_names
     stats_dict["loader_config"] = {
@@ -598,7 +727,13 @@ def train_main():
         "y_cols": list(y_cols) if y_cols is not None else None,
         "promoter_ratio_cols": dl_cfg.get("promoter_ratio_cols", None),
         "promoter_onehot": dl_cfg.get("promoter_onehot", True),
-        "log_transform_cols": log_transform_cols,
+        "promoter_interaction_features": dl_cfg.get("promoter_interaction_features", True),
+        "promoter_pair_onehot": dl_cfg.get("promoter_pair_onehot", True),
+        "promoter_pair_onehot_min_count": dl_cfg.get("promoter_pair_onehot_min_count", 2),
+        "promoter_pair_onehot_max_categories": dl_cfg.get("promoter_pair_onehot_max_categories", 64),
+        "promoter_interaction_eps": dl_cfg.get("promoter_interaction_eps", 1e-8),
+        "log_transform_cols": log_base,
+        "log_transform_cols_extra_for": log_transform_cols_extra_for,
         "log_transform_eps": log_transform_eps,
         "element_embedding": element_embedding,
         "drop_metadata_cols": list(drop_metadata_cols),
@@ -616,9 +751,27 @@ def train_main():
     joblib.dump(stats_dict, meta_path)
     print(f"[INFO] metadata saved => {meta_path}")
 
-    # 3) 数据拆分 & 标准化
+    # 为每个模型准备对应的 metadata（含额外 log 的模型）
+    stats_dict_by_model = {}
+    for m in model_types:
+        stats_m = copy.deepcopy(stats_dict)
+        stats_m["scale_cols_idx"] = scale_cols_idx_by_model.get(m, numeric_cols_idx)
+        extra_cols = extra_cols_by_model.get(m)
+        if extra_cols:
+            # 仅更新连续特征统计与均值
+            stats_extra = extract_data_statistics(
+                X_by_model[m], x_col_names, numeric_cols_idx, Y=Y, y_col_names=y_col_names
+            )
+            stats_m["continuous_cols"] = stats_extra["continuous_cols"]
+            stats_m["feature_means"] = X_by_model[m].mean(axis=0)
+            stats_m["loader_config"]["log_transform_cols"] = log_base + list(extra_cols)
+        stats_dict_by_model[m] = stats_m
+
+    # 3) 数据拆分（用于保存 Y_train/Y_val；各模型训练时会各自 split）
     random_seed = config["data"].get("random_seed", 42)
-    X_train, X_val, Y_train, Y_val = split_data(X, Y, test_size=config["data"]["test_size"], random_state=random_seed)
+    X_train, X_val, Y_train, Y_val = split_data(
+        X_base, Y, test_size=config["data"]["test_size"], random_state=random_seed
+    )
     bounded_cols = config["preprocessing"].get("bounded_output_columns", None)
     if bounded_cols is not None:
         bounded_indices = []
@@ -630,16 +783,6 @@ def train_main():
     else:
         bounded_indices = None
 
-    (X_train_s, X_val_s, sx), (Y_train_s, Y_val_s, sy) = standardize_data(
-        X_train, X_val, Y_train, Y_val,
-        do_input=config["preprocessing"]["standardize_input"],
-        do_output=config["preprocessing"]["standardize_output"],
-        numeric_cols_idx=numeric_cols_idx,
-        scale_cols_idx=scale_cols_idx,
-        do_output_bounded=(bounded_indices is not None) or config["preprocessing"].get("bounded_output", False),
-        bounded_output_cols_idx=bounded_indices
-    )
-
     np.save(os.path.join(base_outdir, "Y_train.npy"), Y_train)
     np.save(os.path.join(base_outdir, "Y_val.npy"), Y_val)
 
@@ -647,7 +790,10 @@ def train_main():
     if config["optuna"].get("enable", False):
         for mtype in config["optuna"]["models"]:
             print(f"\n[INFO] Tuning hyperparameters for {mtype} ...")
-            study, best_params = tune_model(mtype, config, X, Y, numeric_cols_idx, x_col_names, y_col_names, random_seed)
+            study, best_params = tune_model(
+                mtype, config, X_by_model.get(mtype, X_base), Y,
+                numeric_cols_idx, x_col_names, y_col_names, random_seed
+            )
             optuna_dir = get_postprocess_dir(csv_name, run_id, "optuna", mtype)
             ensure_dir(optuna_dir)
             joblib.dump(study, os.path.join(optuna_dir, "study.pkl"))
@@ -662,6 +808,8 @@ def train_main():
 
         for mtype in config["model"]["types"]:
             print(f"[INFO] Running 5‑fold CV for model: {mtype}")
+            scale_cols_idx_cv = _resolve_scale_cols_idx(config, mtype, numeric_cols_idx, X_base.shape[1])
+            X_m = X_by_model.get(mtype, X_base)
 
             # —— 每折分别记录 ——  (先建空 list)
             mse_tr, mse_va = [], []
@@ -669,10 +817,10 @@ def train_main():
             r2_tr, r2_va = [], []
 
             fold_id = 1
-            for train_idx, val_idx in kf.split(X):
+            for train_idx, val_idx in kf.split(X_m):
                 print(f"  • Fold {fold_id}: train={len(train_idx)}, val={len(val_idx)}")
                 # -------------------------------- split / scale
-                X_tr, X_va = X[train_idx], X[val_idx]
+                X_tr, X_va = X_m[train_idx], X_m[val_idx]
                 Y_tr, Y_va = Y[train_idx], Y[val_idx]
 
                 (X_tr_s, X_va_s, _), (Y_tr_s, Y_va_s, sy_fold) = standardize_data(
@@ -680,7 +828,7 @@ def train_main():
                     do_input=config["preprocessing"]["standardize_input"],
                     do_output=config["preprocessing"]["standardize_output"],
                     numeric_cols_idx=numeric_cols_idx,
-                    scale_cols_idx=scale_cols_idx,
+                    scale_cols_idx=scale_cols_idx_cv,
                     do_output_bounded=(bounded_indices is not None) or
                                       config["preprocessing"].get("bounded_output", False),
                     bounded_output_cols_idx=bounded_indices
@@ -782,6 +930,20 @@ def train_main():
     for mtype in model_types:
         val_losses: list[float] | None = None
         print(f"\n=== Train model: {mtype} ===")
+        X_m = X_by_model.get(mtype, X_base)
+        X_train, X_val, Y_train, Y_val = split_data(
+            X_m, Y, test_size=config["data"]["test_size"], random_state=random_seed
+        )
+        scale_cols_idx_m = _resolve_scale_cols_idx(config, mtype, numeric_cols_idx, X_base.shape[1])
+        (X_train_s, X_val_s, sx), (Y_train_s, Y_val_s, sy) = standardize_data(
+            X_train, X_val, Y_train, Y_val,
+            do_input=config["preprocessing"]["standardize_input"],
+            do_output=config["preprocessing"]["standardize_output"],
+            numeric_cols_idx=numeric_cols_idx,
+            scale_cols_idx=scale_cols_idx_m,
+            do_output_bounded=(bounded_indices is not None) or config["preprocessing"].get("bounded_output", False),
+            bounded_output_cols_idx=bounded_indices
+        )
         outdir_m = os.path.join(base_outdir, mtype)
         ensure_dir(outdir_m)
         # 针对ANN，解包返回的超参数字典
@@ -929,6 +1091,11 @@ def train_main():
 
         save_scaler(sx, os.path.join(model_dir, f"scaler_x_{mtype}.pkl"))
         save_scaler(sy, os.path.join(model_dir, f"scaler_y_{mtype}.pkl"))
+        np.save(os.path.join(model_dir, f"scale_cols_idx_{mtype}.npy"),
+                np.array(scale_cols_idx_m, dtype=int))
+        # 保存模型专属 metadata（含额外 log / 缩放配置）
+        stats_m = stats_dict_by_model.get(mtype, stats_dict)
+        joblib.dump(stats_m, os.path.join(model_dir, "metadata.pkl"))
 
         np.save(os.path.join(model_dir, "x_col_names.npy"),
                 np.array(x_col_names, dtype=object))

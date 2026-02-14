@@ -475,12 +475,7 @@ def inference_main():
         print(f"[ERROR] metadata => {meta_path} missing. Please retrain the model.")
         return
 
-    stats_dict = joblib.load(meta_path)
-    numeric_cols_idx = stats_dict["numeric_cols_idx"]
-    scale_cols_idx = stats_dict.get("scale_cols_idx", numeric_cols_idx)
-    onehot_groups = stats_dict.get("onehot_groups", [])
-    group_names = stats_dict.get("group_names", [])
-    group_value_vectors = stats_dict.get("group_value_vectors", {})
+    base_stats_dict = joblib.load(meta_path)
     random_seed = config.get("data", {}).get("random_seed", 42)
     max_combos = config.get("inference", {}).get("max_combinations", None)
 
@@ -498,14 +493,6 @@ def inference_main():
 
         try:
             model, x_col_names, y_col_names = load_inference_model(mtype, config, run_id=run_id)
-
-            meta_x_cols = stats_dict.get("x_col_names")
-            if meta_x_cols is not None and len(meta_x_cols) != len(x_col_names):
-                raise RuntimeError(
-                    f"Feature dimension mismatch between metadata and model for {mtype}: "
-                    f"metadata has {len(meta_x_cols)}, model has {len(x_col_names)}. "
-                    "Please retrain the model."
-                )
         except (FileNotFoundError, RuntimeError) as e:
             print(e)
             _write_inference_error(outdir_m, mtype, e)
@@ -515,12 +502,36 @@ def inference_main():
             _write_inference_error(outdir_m, mtype, e)
             continue
 
-        # --- scaler ---
+        # --- scaler & per-model metadata ---
         model_dir = get_model_dir(csv_name, mtype, run_id=run_id)
+        stats_dict = base_stats_dict
+        meta_m = os.path.join(model_dir, "metadata.pkl")
+        if os.path.exists(meta_m):
+            stats_dict = joblib.load(meta_m)
+
+        meta_x_cols = stats_dict.get("x_col_names")
+        if meta_x_cols is not None and len(meta_x_cols) != len(x_col_names):
+            raise RuntimeError(
+                f"Feature dimension mismatch between metadata and model for {mtype}: "
+                f"metadata has {len(meta_x_cols)}, model has {len(x_col_names)}. "
+                "Please retrain the model."
+            )
+
+        numeric_cols_idx = stats_dict["numeric_cols_idx"]
+        scale_cols_idx_default = stats_dict.get("scale_cols_idx", numeric_cols_idx)
+        scale_cols_idx_by_model = stats_dict.get("scale_cols_idx_by_model", {})
+        onehot_groups = stats_dict.get("onehot_groups", [])
+        group_names = stats_dict.get("group_names", [])
+        group_value_vectors = stats_dict.get("group_value_vectors", {})
+
         sx_path = os.path.join(model_dir, f"scaler_x_{mtype}.pkl")
         sy_path = os.path.join(model_dir, f"scaler_y_{mtype}.pkl")
         scaler_x = load_scaler(sx_path) if os.path.exists(sx_path) else None
         scaler_y = load_scaler(sy_path) if os.path.exists(sy_path) else None
+        scale_cols_idx = scale_cols_idx_by_model.get(mtype, scale_cols_idx_default)
+        scale_idx_path = os.path.join(model_dir, f"scale_cols_idx_{mtype}.npy")
+        if os.path.exists(scale_idx_path):
+            scale_cols_idx = np.load(scale_idx_path).tolist()
 
         # 校验 numeric 列一致性（仅当 scaler_x 存在）
         if scaler_x and len(scale_cols_idx) != scaler_x.n_features_in_:
@@ -588,8 +599,11 @@ def inference_main():
             print("[WARN] Not enough groups => skip confusion.")
             continue
 
-        row_kw = config["inference"]["confusion_axes"]["row_name"]
-        col_kw = config["inference"]["confusion_axes"]["col_name"]
+        conf_default = config["inference"]["confusion_axes"]
+        conf_by_model = config["inference"].get("confusion_axes_by_model", {})
+        conf_m = conf_by_model.get(mtype, {})
+        row_kw = conf_m.get("row_name", conf_default["row_name"])
+        col_kw = conf_m.get("col_name", conf_default["col_name"])
 
         row_idx = find_group_idx_by_name(row_kw, group_names) if group_names else None
         col_idx = find_group_idx_by_name(col_kw, group_names) if group_names else None

@@ -21,9 +21,24 @@ data_loader:
     - "Promoter 2 ratio (Promoter 2:Cu)"
   element_embedding: "advanced"
   promoter_onehot: true
+  promoter_interaction_features: true
+  promoter_pair_onehot: true
+  promoter_pair_onehot_min_count: 2
+  promoter_pair_onehot_max_categories: 64
+  promoter_interaction_eps: 1e-8
   log_transform_cols:
     - "Calcination time (h)"
     - "Molar ratio (Zn:Cu)"
+  # 仅对特定模型追加 log 变换列（在上面的基础上叠加）
+  log_transform_cols_extra_for:
+    SVM:
+      - "H2/CO2 ratio (-)"
+      - "Promoter 1 ratio (Promoter 1:Cu)"
+      - "Promoter 2 ratio (Promoter 2:Cu)"
+    ANN:
+      - "H2/CO2 ratio (-)"
+      - "Promoter 1 ratio (Promoter 1:Cu)"
+      - "Promoter 2 ratio (Promoter 2:Cu)"
   log_transform_eps: 1e-8
 
 # 预处理配置
@@ -31,6 +46,8 @@ preprocessing:
   standardize_input: true
   standardize_output: true
   standardize_all_features: true
+  # 仅对这些模型启用“全特征缩放”（one-hot/embedding 也缩放）
+  standardize_all_features_for: ["SVM", "ANN"]
   bounded_output: false
   bounded_output_columns: ["Methanol selectivity (%)", "CO2 conversion efficiency (%)", "CO selectivity (%)"]
 
@@ -51,15 +68,25 @@ model:
     random_seed: 42
     early_stopping_rounds: 50
     thread_count: -1
+    random_strength: 1.0
+    bagging_temperature: 0.0
+    rsm: 1.0
   xgb_params:
     random_seed: 42
     early_stopping_rounds: 50
     n_jobs: -1
+    min_child_weight: 1.0
+    gamma: 0.0
+    subsample: 1.0
+    colsample_bytree: 1.0
   svm_params:
     kernel: "rbf"
     C: 10.0
     epsilon: 0.1
     gamma: "scale"
+    degree: 3
+    coef0: 0.0
+    max_iter: 20000
 
 # 损失函数配置（主要用于深度学习模型）
 loss:
@@ -86,7 +113,7 @@ inference:
   models: ["CatBoost", "SVM"]
   max_combinations: 200
   n_points: 50                 # ← 原来就有的话保留
-  enable_3d_heatmap: true      # ← 3DHeatmap-X 总开关
+  enable_3d_heatmap: false # ← 3DHeatmap-X 总开关
   #skip_3d_models: ["SVM"]      # ← 可选：指定模型跳过 3D
   heatmap_axes: # ← 统一写这里，长度决定维度
     - "Temperature (°C)"
@@ -95,6 +122,13 @@ inference:
   confusion_axes:
     row_name: "Promoter 1"
     col_name: "Type of sysnthesis procedure"
+  confusion_axes_by_model:
+    SVM:
+      row_name: "Promoter 1"
+      col_name: "Promoter 2"
+    CatBoost:
+      row_name: "Promoter 1"
+      col_name: "Promoter 2"
 
 # Optuna 调参配置
 optuna:
@@ -106,9 +140,9 @@ optuna:
     ANN: ["hidden_dims", "learning_rate", "dropout", "weight_decay", "batch_size"]
     RF: ["n_estimators", "max_depth", "ccp_alpha"]
     DT: ["max_depth", "ccp_alpha"]
-    CatBoost: ["iterations", "learning_rate", "depth", "l2_leaf_reg"]
-    XGB: ["n_estimators", "learning_rate", "max_depth", "reg_alpha", "reg_lambda"]
-    SVM: ["C", "epsilon", "gamma"]
+    CatBoost: ["iterations", "learning_rate", "depth", "l2_leaf_reg", "random_strength", "bagging_temperature", "rsm"]
+    XGB: ["n_estimators", "learning_rate", "max_depth", "reg_alpha", "reg_lambda", "min_child_weight", "gamma", "subsample", "colsample_bytree"]
+    SVM: ["kernel", "C", "epsilon", "gamma"]
   ann_params:
     hidden_dims_choices:
       - [8, 8]
@@ -154,6 +188,12 @@ optuna:
     depth_max: 12
     l2_leaf_reg_min: 1.0
     l2_leaf_reg_max: 5.0
+    random_strength_min: 1e-3
+    random_strength_max: 5.0
+    bagging_temperature_min: 0.0
+    bagging_temperature_max: 10.0
+    rsm_min: 0.6
+    rsm_max: 1.0
   xgb_params:
     n_estimators_min: 100
     n_estimators_max: 500
@@ -162,14 +202,27 @@ optuna:
     max_depth_min: 3
     max_depth_max: 10
     reg_alpha_min: 1e-8
-    reg_alpha_max: 1e-4
+    reg_alpha_max: 1e-1
     reg_lambda_min: 1.0
-    reg_lambda_max: 3.0
+    reg_lambda_max: 10.0
+    min_child_weight_min: 1.0
+    min_child_weight_max: 20.0
+    gamma_min: 1e-8
+    gamma_max: 1.0
+    subsample_min: 0.6
+    subsample_max: 1.0
+    colsample_bytree_min: 0.6
+    colsample_bytree_max: 1.0
   svm_params:
-    kernel: "rbf"
-    C_min: 0.1
-    C_max: 100.0
+    kernel_choices: ["rbf", "poly", "sigmoid"]
+    C_min: 1e-2
+    C_max: 300.0
     epsilon_min: 0.001
-    epsilon_max: 0.5
-    gamma_min: 1e-4
+    epsilon_max: 1.0
+    gamma_min: 1e-5
     gamma_max: 1e-1
+    degree_min: 2
+    degree_max: 6
+    coef0_min: 0.0
+    coef0_max: 2.0
+    max_iter: 20000

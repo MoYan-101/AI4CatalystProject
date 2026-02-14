@@ -11,14 +11,15 @@ class SVMRegression:
     """Multi-output SVM regressor (one SVR per target)."""
 
     def __init__(self, kernel="rbf", C=1.0, epsilon=0.1, gamma="scale",
-                 degree=3, coef0=0.0):
+                 degree=3, coef0=0.0, max_iter=-1):
         base = SVR(
             kernel=kernel,
             C=C,
             epsilon=epsilon,
             gamma=gamma,
             degree=degree,
-            coef0=coef0
+            coef0=coef0,
+            max_iter=max_iter
         )
         self.model = MultiOutputRegressor(base)
 
