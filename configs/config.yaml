@@ -112,7 +112,7 @@ evaluation:
 
 # 推断相关（不作修改）
 inference:
-  models: ["CatBoost", "SVM"]
+  models: ["RF", "CatBoost", "DT", "ANN", "XGB", "SVM"]
   max_combinations: 200
   n_points: 50                 # ← 原来就有的话保留
   enable_3d_heatmap: false # ← 3DHeatmap-X 总开关
@@ -137,7 +137,7 @@ optuna:
   overfit_penalty_alpha: 0.0
   enable: true
   trials: 1400
-  models: ["CatBoost"]
+  models: ["RF", "CatBoost", "DT", "ANN", "XGB", "SVM"]
   slice_params:
     ANN: ["hidden_dims", "learning_rate", "dropout", "weight_decay", "batch_size"]
     RF: ["n_estimators", "max_depth", "ccp_alpha"]
