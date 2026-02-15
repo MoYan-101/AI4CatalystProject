@@ -89,6 +89,7 @@ model:
     degree: 3
     coef0: 0.0
     max_iter: 20000
+    n_jobs: -1
 
 # 损失函数配置（主要用于深度学习模型）
 loss:

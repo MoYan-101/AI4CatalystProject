@@ -35,6 +35,25 @@ You can skip the prompt:
 OVERFIT_ALPHA_LIST="0.0,0.03" bash run.sh
 ```
 
+## Max Performance (CPU)
+`run.sh` now auto-detects CPU threads and applies a high-throughput runtime profile:
+- model-level threads: `MODEL_N_JOBS`, `CATBOOST_THREAD_COUNT`, `XGB_N_JOBS`, `SVM_N_JOBS`
+- torch threads: `TORCH_NUM_THREADS`, `TORCH_NUM_INTEROP_THREADS`
+- BLAS/OpenMP anti-oversubscription defaults (`OMP_NUM_THREADS=1`, etc.)
+
+For full manual control:
+```bash
+CPU_TOTAL=16 \
+MODEL_N_JOBS=16 \
+CATBOOST_THREAD_COUNT=16 \
+XGB_N_JOBS=16 \
+SVM_N_JOBS=16 \
+TORCH_NUM_THREADS=16 \
+TORCH_NUM_INTEROP_THREADS=4 \
+OVERFIT_ALPHA_LIST="0.0" \
+bash run.sh
+```
+
 ## Config Highlights
 - `data.path`: CSV file path.
 - `data_loader.impute_method`: `kde` or `simple` missing value handling.

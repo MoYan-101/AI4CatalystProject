@@ -59,6 +59,82 @@ from itertools import chain
 
 
 # -----------------------------------------------------------------------
+# runtime tuning
+# -----------------------------------------------------------------------
+def _read_env_int(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw in (None, ""):
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        print(f"[WARN] Invalid {name}='{raw}', expected integer; ignore.")
+        return None
+    if value < 1:
+        print(f"[WARN] Invalid {name}='{raw}', expected >= 1; ignore.")
+        return None
+    return value
+
+
+def _apply_runtime_overrides(config: dict) -> None:
+    model_cfg = config.setdefault("model", {})
+    rf_cfg = model_cfg.setdefault("rf_params", {})
+    xgb_cfg = model_cfg.setdefault("xgb_params", {})
+    cat_cfg = model_cfg.setdefault("catboost_params", {})
+    svm_cfg = model_cfg.setdefault("svm_params", {})
+
+    model_n_jobs = _read_env_int("MODEL_N_JOBS")
+    rf_n_jobs = _read_env_int("RF_N_JOBS")
+    xgb_n_jobs = _read_env_int("XGB_N_JOBS")
+    cat_threads = _read_env_int("CATBOOST_THREAD_COUNT")
+    svm_n_jobs = _read_env_int("SVM_N_JOBS")
+
+    if model_n_jobs is not None:
+        rf_cfg["n_jobs"] = model_n_jobs
+        xgb_cfg["n_jobs"] = model_n_jobs
+        cat_cfg["thread_count"] = model_n_jobs
+        svm_cfg["n_jobs"] = model_n_jobs
+    if rf_n_jobs is not None:
+        rf_cfg["n_jobs"] = rf_n_jobs
+    if xgb_n_jobs is not None:
+        xgb_cfg["n_jobs"] = xgb_n_jobs
+    if cat_threads is not None:
+        cat_cfg["thread_count"] = cat_threads
+    if svm_n_jobs is not None:
+        svm_cfg["n_jobs"] = svm_n_jobs
+
+    print(
+        "[INFO] Model threads => "
+        f"RF n_jobs={rf_cfg.get('n_jobs', -1)}, "
+        f"XGB n_jobs={xgb_cfg.get('n_jobs', -1)}, "
+        f"CatBoost thread_count={cat_cfg.get('thread_count', -1)}, "
+        f"SVM n_jobs={svm_cfg.get('n_jobs', -1)}"
+    )
+
+
+def _configure_torch_runtime() -> None:
+    torch_threads = _read_env_int("TORCH_NUM_THREADS")
+    if torch_threads is not None:
+        try:
+            torch.set_num_threads(torch_threads)
+        except Exception as e:
+            print(f"[WARN] Failed to set TORCH_NUM_THREADS={torch_threads}: {e}")
+
+    interop_threads = _read_env_int("TORCH_NUM_INTEROP_THREADS")
+    if interop_threads is not None:
+        try:
+            torch.set_num_interop_threads(interop_threads)
+        except Exception as e:
+            print(f"[WARN] Failed to set TORCH_NUM_INTEROP_THREADS={interop_threads}: {e}")
+
+    print(
+        "[INFO] Torch threads => "
+        f"num_threads={torch.get_num_threads()}, "
+        f"num_interop_threads={torch.get_num_interop_threads()}"
+    )
+
+
+# -----------------------------------------------------------------------
 # helper ranges
 # -----------------------------------------------------------------------
 def _safe_float_range(cfg, lo_key, hi_key, min_bump=1.01):
@@ -218,7 +294,8 @@ def tune_model(model_type, config, X, Y,
                 max_depth       = trial.suggest_int ("max_depth",    d_lo, d_hi),
                 ccp_alpha       = trial.suggest_float("ccp_alpha",   c_lo, c_hi),
                 min_samples_leaf= trial.suggest_int ("min_samples_leaf", l_lo, l_hi),
-                random_state=random_seed
+                random_state=random_seed,
+                n_jobs=config["model"]["rf_params"].get("n_jobs", -1)
             )
             model_instance = train_sklearn_model(model_instance, X_train_s, Y_train_s)
             pred_train, pred_val = model_instance.predict(X_train_s), model_instance.predict(X_val_s)
@@ -261,7 +338,8 @@ def tune_model(model_type, config, X, Y,
                 random_strength = trial.suggest_float("random_strength", rs_lo, rs_hi, log=True),
                 bagging_temperature = trial.suggest_float("bagging_temperature", bt_lo, bt_hi),
                 rsm = trial.suggest_float("rsm", rsm_lo, rsm_hi),
-                random_seed  = config["model"]["catboost_params"]["random_seed"]
+                random_seed  = config["model"]["catboost_params"]["random_seed"],
+                thread_count = config["model"]["catboost_params"].get("thread_count", -1)
             )
             model_instance.fit(X_train_s, Y_train_s,
                                eval_set=(X_val_s, Y_val_s),
@@ -301,7 +379,8 @@ def tune_model(model_type, config, X, Y,
                 gamma        = trial.suggest_float("gamma", gm_lo, gm_hi, log=True),
                 subsample    = trial.suggest_float("subsample", ss_lo, ss_hi),
                 colsample_bytree = trial.suggest_float("colsample_bytree", cs_lo, cs_hi),
-                random_state = config["model"]["xgb_params"]["random_seed"]
+                random_state = config["model"]["xgb_params"]["random_seed"],
+                n_jobs = config["model"]["xgb_params"].get("n_jobs", -1)
             )
             model_instance = train_sklearn_model(model_instance, X_train_s, Y_train_s,
                                                  X_val=X_val_s, Y_val=Y_val_s,
@@ -314,6 +393,7 @@ def tune_model(model_type, config, X, Y,
             e_lo, e_hi = _safe_float_range(base, "epsilon_min", "epsilon_max")
             g_lo, g_hi = _safe_float_range(base, "gamma_min", "gamma_max")
             max_iter = int(base.get("max_iter", 20000))
+            svm_n_jobs = int(config.get("model", {}).get("svm_params", {}).get("n_jobs", -1))
             k_choices = base.get("kernel_choices", None)
             if k_choices is None:
                 k_cfg = base.get("kernel", "rbf")
@@ -341,7 +421,8 @@ def tune_model(model_type, config, X, Y,
                 gamma=gamma,
                 degree=degree if degree is not None else 3,
                 coef0=coef0 if coef0 is not None else 0.0,
-                max_iter=max_iter
+                max_iter=max_iter,
+                n_jobs=svm_n_jobs
             )
             model_instance = train_sklearn_model(model_instance, X_train_s, Y_train_s)
             pred_train, pred_val = model_instance.predict(X_train_s), model_instance.predict(X_val_s)
@@ -526,6 +607,7 @@ def create_model_by_type(model_type, config, random_seed=42, input_dim=None):
         svm_cfg.setdefault("degree", 3)
         svm_cfg.setdefault("coef0", 0.0)
         svm_cfg.setdefault("max_iter", 20000)
+        svm_cfg.setdefault("n_jobs", -1)
         return SVMRegression(
             kernel=svm_cfg["kernel"],
             C=svm_cfg["C"],
@@ -533,7 +615,8 @@ def create_model_by_type(model_type, config, random_seed=42, input_dim=None):
             gamma=svm_cfg["gamma"],
             degree=svm_cfg["degree"],
             coef0=svm_cfg["coef0"],
-            max_iter=svm_cfg["max_iter"]
+            max_iter=svm_cfg["max_iter"],
+            n_jobs=svm_cfg["n_jobs"]
         )
     else:
         raise ValueError(f"Unknown model type: {model_type}")
@@ -545,6 +628,8 @@ def train_main():
     config_path = os.path.join(os.path.dirname(__file__), "configs", "config.yaml")
     with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
+    _configure_torch_runtime()
+    _apply_runtime_overrides(config)
     env_alpha = os.environ.get("OVERFIT_ALPHA")
     if env_alpha not in (None, ""):
         try:

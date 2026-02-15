@@ -17,6 +17,36 @@ if [ -z "$PY" ]; then
     PY="python3 -u"
   fi
 fi
+
+CPU_TOTAL="${CPU_TOTAL:-$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN || echo 1)}"
+if ! [ "$CPU_TOTAL" -ge 1 ] 2>/dev/null; then
+  CPU_TOTAL=1
+fi
+
+# Model-level parallelism (use all logical CPUs by default).
+export MODEL_N_JOBS="${MODEL_N_JOBS:-$CPU_TOTAL}"
+export CATBOOST_THREAD_COUNT="${CATBOOST_THREAD_COUNT:-$CPU_TOTAL}"
+export XGB_N_JOBS="${XGB_N_JOBS:-$CPU_TOTAL}"
+export SVM_N_JOBS="${SVM_N_JOBS:-$CPU_TOTAL}"
+
+# Avoid nested BLAS/OpenMP over-subscription when model-level n_jobs is high.
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
+export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-1}"
+export BLIS_NUM_THREADS="${BLIS_NUM_THREADS:-1}"
+
+# Torch CPU threading (for ANN and torch inference on CPU).
+export TORCH_NUM_THREADS="${TORCH_NUM_THREADS:-$CPU_TOTAL}"
+TORCH_INTEROP_DEFAULT=$((CPU_TOTAL / 4))
+if [ "$TORCH_INTEROP_DEFAULT" -lt 1 ]; then
+  TORCH_INTEROP_DEFAULT=1
+fi
+if [ "$TORCH_INTEROP_DEFAULT" -gt 4 ]; then
+  TORCH_INTEROP_DEFAULT=4
+fi
+export TORCH_NUM_INTEROP_THREADS="${TORCH_NUM_INTEROP_THREADS:-$TORCH_INTEROP_DEFAULT}"
 if [ -z "$RUN_ID" ]; then
   BASE_RUN_ID=$(date +"%Y%m%d_%H%M%S")
 else
@@ -39,6 +69,7 @@ else
 fi
 
 export PYTHONUNBUFFERED=1
+echo "[INFO] CPU_TOTAL=$CPU_TOTAL MODEL_N_JOBS=$MODEL_N_JOBS CATBOOST_THREAD_COUNT=$CATBOOST_THREAD_COUNT XGB_N_JOBS=$XGB_N_JOBS SVM_N_JOBS=$SVM_N_JOBS TORCH_NUM_THREADS=$TORCH_NUM_THREADS TORCH_NUM_INTEROP_THREADS=$TORCH_NUM_INTEROP_THREADS OMP_NUM_THREADS=$OMP_NUM_THREADS"
 for alpha in "${ALPHAS[@]}"; do
   if [ -n "$alpha" ]; then
     export OVERFIT_ALPHA="$alpha"
